@@ -28,7 +28,6 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use crate::client::name_resolution::ResolverBuilder;
-
 static GLOBAL_RESOLVER_REGISTRY: OnceLock<ResolverRegistry> = OnceLock::new();
 
 /// A registry to store and retrieve name resolvers.  Resolvers are indexed by
