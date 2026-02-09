@@ -133,12 +133,11 @@ impl Display for Target {
     }
 }
 
-/// Returns a default target that can be used when the user does not provide a valid one.
-pub(crate) fn default_target() -> Target {
-    match Target::from_str("inert:///target") {
-        Ok(t) => t,
-        Err(_) => unreachable!("Failed to parse default target URI."),
-    }
+/// Returns a default target with the default scheme and empty path. 
+/// This is used as a fallback when parsing the input target fails.
+// Currently hard-coded as "dns://", but may be configurable in the future.
+fn default_target() -> Target {
+    Target::from_str("dns://").unwrap() // Guaranteed safe.
 }
 
 /// A name resolver factory that produces Resolver instances used by the channel
@@ -165,6 +164,12 @@ pub(crate) trait ResolverBuilder: Send + Sync {
         let path = target.path();
         path.strip_prefix("/").unwrap_or(path).to_string()
     }
+
+    /// Returns a bool indicating whether the input uri is valid to create a
+    /// resolver of this type. This is used to determine if a resolver is appropriate
+    /// for a given target without having to build the resolver. 
+    // This is heavily used by load balancing policies to choose a resolver.
+    fn is_valid_uri(&self, uri: &Target) -> bool;
 }
 
 /// A collection of data configured on the channel that is constructing this
@@ -187,6 +192,34 @@ pub(crate) struct ResolverOptions {
     /// A hook into the channel's work scheduler that allows the Resolver to
     /// request the ability to perform operations on the ChannelController.
     pub work_scheduler: Arc<dyn WorkScheduler>,
+}
+
+fn choose_resolver(target: &str) -> Arc<dyn ResolverBuilder> {
+    // Try to create a target with passed string.
+
+    // If not successful, re-try using default schema prefixed.
+
+    // If still not successful, provide fallback target.
+
+    // Get resolver builder from global registry for target.
+
+    // If not found, .
+
+
+
+   let (resolver_builder, t) = match Target::from_str(target) {
+        Ok(target) => match global_registry().get(target.scheme()) {
+            Some(builder) => (builder.clone(), target),
+            None => (
+                default_builder(format!("No resolver found for scheme: {}", target.scheme())),
+                target,
+            ),
+        },
+        Err(e) => (
+            default_builder(format!("Failed to parse target URI: {}", target)),
+            default_target(),
+        ),
+    }
 }
 
 /// Used to asynchronously request a call into the Resolver's work method.
@@ -347,29 +380,6 @@ impl Resolver for NopResolver {
 
     fn work(&mut self, channel_controller: &mut dyn ChannelController) {
         let _ = channel_controller.update(self.update.clone());
-    }
-}
-
-// A builder for a resolver that will always fail with a configuration error.
-pub(crate) struct MisconfiguredBuilder {
-    pub(crate) error: String,
-}
-
-impl ResolverBuilder for MisconfiguredBuilder {
-    fn build(&self, _target: &Target, options: ResolverOptions) -> Box<dyn Resolver> {
-        options.work_scheduler.schedule_work();
-        Box::new(NopResolver {
-            update: ResolverUpdate {
-                endpoints: Err(self.error.clone()),
-                service_config: Ok(None),
-                attributes: Attributes {},
-                resolution_note: None,
-            },
-        })
-    }
-
-    fn scheme(&self) -> &'static str {
-        "configuration-error"
     }
 }
 

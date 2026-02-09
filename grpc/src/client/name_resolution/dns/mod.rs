@@ -236,6 +236,15 @@ impl ResolverBuilder for Builder {
     fn scheme(&self) -> &'static str {
         "dns"
     }
+
+    fn is_valid_uri(&self, target: &Target) -> bool {
+        if let Err(err) = parse_endpoint_and_authority(target) {
+            eprintln!("{err}");
+            false
+        } else {
+            true
+        }
+    }
 }
 
 struct DnsResolver {
