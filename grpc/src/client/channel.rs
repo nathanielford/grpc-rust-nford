@@ -56,8 +56,7 @@ use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::pick_first;
 use crate::client::load_balancing::{self};
 use crate::client::name_resolution::{
-    self, global_registry, Address, MisconfiguredBuilder, ResolverBuilder, ResolverUpdate, Target,
-    default_target,
+    self, Address, ResolverBuilder, ResolverUpdate, Target, default_target, global_registry,
 };
 use crate::client::service_config::ServiceConfig;
 use crate::client::subchannel::InternalSubchannel;
@@ -72,12 +71,11 @@ use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::rt;
 use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
+use crate::rt::Runtime;
 use crate::rt::default_runtime;
 use crate::service::Request;
 use crate::service::Response;
 use crate::service::Service;
-
-use crate::{client::ConnectivityState, rt::Runtime};
 
 #[non_exhaustive]
 pub struct ChannelOptions {
@@ -432,7 +430,7 @@ impl InternalChannelController {
             connectivity_state,
             runtime,
         }
-    } 
+    }
 
     fn new_esc_for_isc(&self, isc: Arc<InternalSubchannel>) -> Arc<dyn Subchannel> {
         let sc = Arc::new(ExternalSubchannel::new(isc.clone(), self.wqtx.clone()));
