@@ -26,10 +26,10 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
-use crate::metadata::MetadataMap;
 use rand::seq::SliceRandom;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
@@ -50,6 +50,7 @@ use crate::client::name_resolution::Address;
 use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::core::RequestHeaders;
+use crate::metadata::MetadataMap;
 use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
 
@@ -73,16 +74,14 @@ impl LbPolicyBuilder for PickFirstBuilder {
         PickFirstPolicy {
             work_scheduler: options.work_scheduler,
             runtime: options.runtime,
-            connectivity_state: ConnectivityState::Connecting,
+            connectivity_state: ConnectivityState::Idle,
             subchannels: Vec::default(),
             subchannel_states: HashMap::default(),
             selected: None,
             frontier_index: 0,
-            last_resolver_error: None,
             last_connection_error: None,
             shuffler: build_shuffler(),
-            timer_expired: Arc::new(AtomicBool::new(false)),
-            timer_handle: None,
+            timer: None,
             steady_state: None,
         }
     }
@@ -113,17 +112,20 @@ pub(crate) struct PickFirstPolicy {
     frontier_index: usize,
 
     // Detailed error tracking.
-    last_resolver_error: Option<String>,
     last_connection_error: Option<String>,
 
     // Injectable shuffler for deterministic testing.
     shuffler: Arc<ShufflerFn>,
 
     // Timer state tracks when the last connect attempt was started.
-    timer_expired: Arc<AtomicBool>,
-    timer_handle: Option<BoxedTaskHandle>,
+    timer: Option<Timer>,
 
     // Steady state tracking for continuous retries after pass exhaustion.
+    // TODO: should steady_state be a "mode" selector enum, e.g.:
+    // - FirstPass - holds the timer above
+    // - SteadyState - existing info
+    // - Ready - holds selected subchannel
+    // - Error - for zero addresses; holds no data
     steady_state: Option<SteadyState>,
 }
 
@@ -134,7 +136,6 @@ impl Debug for PickFirstPolicy {
             .field("selected", &self.selected)
             .field("frontier_index", &self.frontier_index)
             .field("connectivity_state", &self.connectivity_state)
-            .field("last_resolver_error", &self.last_resolver_error)
             .field("last_connection_error", &self.last_connection_error)
             .finish()
     }
@@ -191,16 +192,34 @@ impl PickFirstPolicy {
         ready_subchannel
     }
 
-    /// Call when the selected subchannel is dropped or loses connection.
+    /// Call when the selected subchannel loses connection.
     // This causes the LB to go IDLE.
     fn subchannel_drop(&mut self, channel_controller: &mut dyn ChannelController) {
         self.selected = None;
-        self.connectivity_state = ConnectivityState::Idle;
+        self.update_picker(
+            ConnectivityState::Connecting,
+            Arc::new(IdlePicker::new(self.work_scheduler.clone())),
+            channel_controller,
+        );
+    }
+
+    fn update_picker(
+        &mut self,
+        connectivity_state: ConnectivityState,
+        picker: Arc<dyn Picker>,
+        channel_controller: &mut dyn ChannelController,
+    ) {
+        if self.connectivity_state == connectivity_state
+            && connectivity_state == ConnectivityState::Connecting
+        {
+            // Prevent redundant connecting updates.
+            // TODO: prevent redundant IDLE updates?
+            return;
+        }
+        self.connectivity_state = connectivity_state;
         channel_controller.update_picker(LbState {
-            connectivity_state: ConnectivityState::Idle,
-            picker: Arc::new(IdlePicker {
-                work_scheduler: self.work_scheduler.clone(),
-            }),
+            connectivity_state,
+            picker,
         });
     }
 
@@ -214,18 +233,15 @@ impl PickFirstPolicy {
             return;
         }
         self.selected = Some(subchannel.clone());
-        self.connectivity_state = ConnectivityState::Ready;
         self.subchannels = vec![subchannel.clone()]; // Keep only the winner.
         self.steady_state = None; // Reset mode to First Pass.
+        self.timer = None; // Stop the happy eyeballs timer.
 
-        if let Some(handle) = self.timer_handle.take() {
-            handle.abort();
-        }
-
-        channel_controller.update_picker(LbState {
-            connectivity_state: ConnectivityState::Ready,
-            picker: Arc::new(OneSubchannelPicker { sc: subchannel }),
-        });
+        self.update_picker(
+            ConnectivityState::Ready,
+            Arc::new(OneSubchannelPicker { sc: subchannel }),
+            channel_controller,
+        );
     }
 
     /// Starts a connection pass through the address list.
@@ -236,15 +252,19 @@ impl PickFirstPolicy {
         // If there is a viable subchannel at the frontier, connect to it and
         // update picker to CONNECTING.
         if let Some(sc) = self.advance_frontier(true) {
-            let sc = sc.clone(); // Avoid borrow issues.
             self.trigger_subchannel_connection(sc, channel_controller);
 
-            channel_controller.update_picker(LbState {
-                connectivity_state: ConnectivityState::Connecting,
-                picker: Arc::new(QueuingPicker {}),
-            });
+            // TODO: avoid this update if we are in TF (i.e. sticky TF)?
+            self.update_picker(
+                ConnectivityState::Connecting,
+                Arc::new(QueuingPicker {}),
+                channel_controller,
+            );
         } else {
             // Otherwise all addresses are in transient failure: update picker.
+            // TODO: set the last connection error?  Is it correct to do so,
+            // e.g. if the address it came from was removed from the address
+            // list and a name resolver update triggered this connection pass?
             _ = self.set_transient_failure(channel_controller, None);
         }
     }
@@ -263,11 +283,9 @@ impl PickFirstPolicy {
         if let Some(attempting) = self.subchannels.get(self.frontier_index)
             && attempting.address() == subchannel.address()
             && state.connectivity_state == ConnectivityState::TransientFailure
+            && let Some(next_sc) = self.advance_frontier(false)
         {
-            if let Some(next_sc) = self.advance_frontier(false) {
-                let next_sc = next_sc.clone();
-                self.trigger_subchannel_connection(next_sc, channel_controller);
-            }
+            self.trigger_subchannel_connection(next_sc, channel_controller);
         }
 
         // Check if First Pass is fully exhausted (frontier exhausted AND zero connecting).
@@ -278,8 +296,10 @@ impl PickFirstPolicy {
                     .is_some_and(|s| s.connectivity_state == ConnectivityState::Connecting)
             });
 
-            if !any_connecting && self.steady_state.is_none() {
-                self.abort_happy_eyeballs_timer();
+            if !any_connecting {
+                // Nothing currently connecting; first pass complete.  Enter
+                // steady state.
+                self.timer = None;
                 let error = self.last_connection_error.clone();
                 _ = self.set_transient_failure(channel_controller, error);
                 self.steady_state = Some(SteadyState::new(self.subchannels.len()));
@@ -303,7 +323,8 @@ impl PickFirstPolicy {
     /// Advances the frontier to the next non-TransientFailure subchannel and
     /// returns it. If `reset` is true, starts the scan from index 0.
     // The frontier is the latest index in which connectivity has been attempted.
-    fn advance_frontier(&mut self, reset: bool) -> Option<&Arc<dyn Subchannel>> {
+    // Returns a cloned Subchannel to avoid borrowing from self.
+    fn advance_frontier(&mut self, reset: bool) -> Option<Arc<dyn Subchannel>> {
         if reset {
             self.frontier_index = 0;
         } else {
@@ -323,7 +344,7 @@ impl PickFirstPolicy {
                 // Push the frontier if sc is in TransientFailure
                 ConnectivityState::TransientFailure => self.frontier_index += 1,
                 // Otherwise return the subchannel.
-                _ => return Some(sc),
+                _ => return Some(sc.clone()),
             }
         }
         None
@@ -356,8 +377,6 @@ impl PickFirstPolicy {
         sc: Arc<dyn Subchannel>,
         channel_controller: &mut dyn ChannelController,
     ) {
-        let sc_clone = sc.clone();
-        self.connectivity_state = ConnectivityState::Connecting;
         self.subchannel_states.insert(
             sc.address(),
             SubchannelState {
@@ -365,38 +384,25 @@ impl PickFirstPolicy {
                 last_connection_error: None,
             },
         );
-        sc_clone.connect();
+        sc.connect();
 
-        // Cancel any existing timer
-        if let Some(handle) = self.timer_handle.take() {
-            handle.abort();
-        }
-
-        // Start 250ms timer
-        let timer_expired = self.timer_expired.clone();
-        let work_scheduler = self.work_scheduler.clone();
-
-        let sleep_fut = self.runtime.sleep(std::time::Duration::from_millis(250));
-        let handle = self.runtime.spawn(Box::pin(async move {
-            sleep_fut.await;
-            timer_expired.store(true, Ordering::SeqCst);
-            work_scheduler.schedule_work();
-        }));
-        self.timer_handle = Some(handle);
+        // Start happy eyeballs timer; replacing any pre-existing timer.
+        self.timer = Some(Timer::start(
+            self.runtime.clone(),
+            self.work_scheduler.clone(),
+        ));
     }
 
     // Converts the update endpoints to an address list.
     // Shuffles endpoints (if enabled) before flattening and de-duplication.
     fn compile_address(
         &mut self,
-        endpoints: Vec<Endpoint>,
+        mut endpoints: Vec<Endpoint>,
         config: Option<&PickFirstConfig>,
         channel_controller: &mut dyn ChannelController,
-    ) -> Result<Vec<Address>, String> {
-        let mut endpoints = endpoints;
-
+    ) -> Vec<Address> {
         // Shuffle endpoints if enabled.
-        if config.map_or(false, |c| c.shuffle_address_list) {
+        if config.is_some_and(|c| c.shuffle_address_list) {
             (self.shuffler)(&mut endpoints);
         }
 
@@ -446,19 +452,12 @@ impl PickFirstPolicy {
                 break;
             }
         }
-
-        // If we have no addresses, clear subchannels and set TRANSIENT_FAILURE.
-        if interleaved.is_empty() {
-            self.subchannels.clear();
-            self.selected = None;
-            self.set_transient_failure(channel_controller, Some("empty address list".to_string()))?;
-        }
-
-        Ok(interleaved)
+        interleaved
     }
 
     // Sets LB state to TRANSIENT_FAILURE and updates picker with error.
     // Triggers a re-resolution request.
+    // TODO: make error mandatory.
     fn set_transient_failure(
         &mut self,
         channel_controller: &mut dyn ChannelController,
@@ -468,33 +467,17 @@ impl PickFirstPolicy {
         if let Some(e) = error {
             self.last_connection_error = Some(e);
         }
-        self.connectivity_state = ConnectivityState::TransientFailure;
         let err = self
             .last_connection_error
             .clone()
             .expect("no last connection error set");
-        channel_controller.update_picker(LbState {
-            connectivity_state: ConnectivityState::TransientFailure,
-            picker: Arc::new(FailingPicker { error: err.clone() }),
-        });
+        self.update_picker(
+            ConnectivityState::TransientFailure,
+            Arc::new(FailingPicker { error: err.clone() }),
+            channel_controller,
+        );
         channel_controller.request_resolution();
         Err(err.clone())
-    }
-
-    // Returns true if the currently selected subchannel's address is still
-    // present in the new address list.
-    fn sticky(&self, new_addresses: &[Address]) -> bool {
-        self.selected
-            .as_ref()
-            .map(|sc| new_addresses.contains(&sc.address()))
-            .unwrap_or(false)
-    }
-
-    // Cancels the connection 'Happy Eyeballs' timer if it is active.
-    fn abort_happy_eyeballs_timer(&mut self) {
-        if let Some(handle) = self.timer_handle.take() {
-            handle.abort();
-        }
     }
 }
 
@@ -507,14 +490,24 @@ impl LbPolicy for PickFirstPolicy {
         config: Option<&Self::LbConfig>,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
-        self.abort_happy_eyeballs_timer();
+        self.timer = None;
 
         // Reset steady state on new update
         self.steady_state = None;
 
         match update.endpoints {
             Ok(endpoints) => {
-                let new_addresses = self.compile_address(endpoints, config, channel_controller)?;
+                let new_addresses = self.compile_address(endpoints, config, channel_controller);
+                // If we have no addresses, clear subchannels and set TRANSIENT_FAILURE.
+                if new_addresses.is_empty() {
+                    self.subchannels.clear();
+                    self.selected = None;
+                    self.set_transient_failure(
+                        channel_controller,
+                        Some("empty address list".to_string()),
+                    )?;
+                }
+
                 if let Some(ready_subchannel) =
                     self.rebuild_subchannels(new_addresses, channel_controller)
                 {
@@ -576,13 +569,13 @@ impl LbPolicy for PickFirstPolicy {
             }
             (false, _) => {
                 // Always capture freshest unselected error.
-                if state.connectivity_state == ConnectivityState::TransientFailure {
-                    if let Some(err) = &state.last_connection_error {
-                        self.last_connection_error = Some(err.clone());
-                    }
+                if state.connectivity_state == ConnectivityState::TransientFailure
+                    && let Some(err) = &state.last_connection_error
+                {
+                    self.last_connection_error = Some(err.clone());
                 }
 
-                // Track progress based on whether we are connection pass.
+                // Track progress based on whether we are in a connection pass.
                 if let Some(steady) = self.steady_state.as_mut() {
                     steady.subchannel_nonready(channel_controller, subchannel, state);
                 } else {
@@ -594,17 +587,13 @@ impl LbPolicy for PickFirstPolicy {
 
     fn work(&mut self, channel_controller: &mut dyn ChannelController) {
         if self.connectivity_state == ConnectivityState::Idle {
+            // TODO: is it safe to assume any call to work() while idle means we
+            // should connect?
             self.exit_idle(channel_controller);
-        } else if self.connectivity_state == ConnectivityState::Connecting {
-            // Check if timer expired
-            if self.timer_expired.load(Ordering::SeqCst) {
-                self.timer_expired.store(false, Ordering::SeqCst); // Reset
-
-                // Advance frontier and trigger next connection.
-                if let Some(next_sc) = self.advance_frontier(false) {
-                    let next_sc = next_sc.clone();
-                    self.trigger_subchannel_connection(next_sc, channel_controller);
-                }
+        } else if self.timer.as_ref().is_some_and(|t| t.expired()) {
+            // Advance frontier and trigger next connection.
+            if let Some(next_sc) = self.advance_frontier(false) {
+                self.trigger_subchannel_connection(next_sc, channel_controller);
             }
         }
     }
@@ -614,9 +603,35 @@ impl LbPolicy for PickFirstPolicy {
     }
 }
 
-impl Drop for PickFirstPolicy {
+/// Implements the happy eyeballs timer task.  `expired` becomes set when it
+/// fires.  When dropped, the timer is cancelled.
+struct Timer {
+    expired: Arc<AtomicBool>,
+    handle: BoxedTaskHandle,
+}
+
+impl Timer {
+    /// Starts a new timer, returning it.
+    fn start(runtime: GrpcRuntime, work_scheduler: Arc<dyn WorkScheduler>) -> Self {
+        let expired = Arc::new(AtomicBool::new(false));
+        let expired_clone = expired.clone();
+        let handle = runtime.clone().spawn(Box::pin(async move {
+            runtime.sleep(std::time::Duration::from_millis(250)).await;
+            expired_clone.store(true, Ordering::SeqCst);
+            work_scheduler.schedule_work();
+        }));
+        Self { expired, handle }
+    }
+
+    /// Returns whether the timer has expired yet.
+    fn expired(&self) -> bool {
+        self.expired.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Timer {
     fn drop(&mut self) {
-        self.abort_happy_eyeballs_timer();
+        self.handle.abort();
     }
 }
 
@@ -637,12 +652,24 @@ impl Picker for OneSubchannelPicker {
 
 #[derive(Debug)]
 struct IdlePicker {
+    triggered_work: AtomicBool,
     work_scheduler: Arc<dyn WorkScheduler>,
+}
+
+impl IdlePicker {
+    fn new(work_scheduler: Arc<dyn WorkScheduler>) -> Self {
+        Self {
+            triggered_work: AtomicBool::new(false),
+            work_scheduler,
+        }
+    }
 }
 
 impl Picker for IdlePicker {
     fn pick(&self, _: &RequestHeaders) -> PickResult {
-        self.work_scheduler.schedule_work();
+        if !self.triggered_work.swap(true, Ordering::SeqCst) {
+            self.work_scheduler.schedule_work();
+        }
         PickResult::Queue
     }
 }
@@ -705,12 +732,13 @@ impl SteadyState {
 
 #[cfg(test)]
 mod test {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     use super::*;
     use crate::client::load_balancing::test_utils::{
         TestChannelController, TestEvent, TestWorkScheduler,
     };
-    use std::sync::mpsc;
-    use std::time::Duration;
 
     // Helper to create endpoints from a list of address strings.
     // If attrs are provided, they will be added to each endpoint; otherwise,
@@ -1166,7 +1194,10 @@ mod test {
 
         // Simulate timer expiration by setting the flag directly.
         policy
-            .timer_expired
+            .timer
+            .as_ref()
+            .unwrap()
+            .expired
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
         // Manually call work() to process the timer expiration.
@@ -1436,7 +1467,12 @@ mod test {
 
         // 1. Simulate Happy Eyeballs timer firing to launch parallel connection
         // to addr2.
-        policy.timer_expired.store(true, Ordering::SeqCst);
+        policy
+            .timer
+            .as_ref()
+            .unwrap()
+            .expired
+            .store(true, Ordering::SeqCst);
         policy.work(controller.as_mut());
 
         match rx.recv().unwrap() {
