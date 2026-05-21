@@ -1211,8 +1211,7 @@ mod test {
     // the next subchannel and trigger a connection attempt.
     #[tokio::test]
     async fn test_pick_first_timer_advancement() {
-        let (rx, mut policy, mut controller) =
-            simulate_connection(vec!["addr1", "addr2"], None);
+        let (rx, mut policy, mut controller) = simulate_connection(vec!["addr1", "addr2"], None);
 
         // Simulate timer expiration by setting the flag directly.
         policy
@@ -1234,8 +1233,7 @@ mod test {
     // steady state and monitor for backoff expiry to retry connections.
     #[tokio::test]
     async fn test_pick_first_steady_state_retries() {
-        let (rx, mut policy, mut controller) =
-            simulate_failed_connection(vec!["addr1"], None);
+        let (rx, mut policy, mut controller) = simulate_failed_connection(vec!["addr1"], None);
         let sc1 = policy.subchannels[0].clone();
 
         // Expect UpdatePicker(TransientFailure) and RequestResolution.
@@ -1493,8 +1491,7 @@ mod test {
     // before failing the channel.
     #[tokio::test]
     async fn test_pick_first_happy_eyeballs_out_of_order_failure() {
-        let (rx, mut policy, mut controller) =
-            simulate_connection(vec!["addr1", "addr2"], None);
+        let (rx, mut policy, mut controller) = simulate_connection(vec!["addr1", "addr2"], None);
 
         // 1. Simulate Happy Eyeballs timer firing to launch parallel connection
         // to addr2.
@@ -1547,8 +1544,7 @@ mod test {
     // stale connection errors.
     #[tokio::test]
     async fn test_pick_first_steady_state_freshest_error() {
-        let (rx, mut policy, mut controller) =
-            simulate_failed_connection(vec!["addr1"], None);
+        let (rx, mut policy, mut controller) = simulate_failed_connection(vec!["addr1"], None);
 
         // Consume exhaustion events.
         let state = expect_picker_update(&rx);
@@ -1583,8 +1579,7 @@ mod test {
     // reconnects when the work scheduler runs.
     #[tokio::test]
     async fn test_pick_first_disconnect_to_idle_and_reconnect() {
-        let (rx, mut policy, mut controller) =
-            simulate_successful_connection(vec!["addr1"], None);
+        let (rx, mut policy, mut controller) = simulate_successful_connection(vec!["addr1"], None);
 
         // 1. Consume the initial Ready picker update.
         let state = expect_picker_update(&rx);
