@@ -790,68 +790,50 @@ mod test {
         (rx, policy, controller)
     }
 
-    async fn recv_async(rx: &mpsc::Receiver<TestEvent>) -> TestEvent {
-        let start = std::time::Instant::now();
-        loop {
-            match rx.try_recv() {
-                Ok(event) => return event,
-                Err(mpsc::TryRecvError::Empty) => {
-                    if start.elapsed() > DEFAULT_TEST_DURATION {
-                        panic!("timed out waiting for event after {DEFAULT_TEST_DURATION:?}");
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    panic!("channel disconnected");
-                }
-            }
+    fn expect_new_subchannel(rx: &mpsc::Receiver<TestEvent>) -> Arc<dyn Subchannel> {
+        match rx.try_recv() {
+            Ok(TestEvent::NewSubchannel(sc)) => sc,
+            Ok(other) => panic!("expected NewSubchannel, got {:?}", other),
+            Err(e) => panic!("expected NewSubchannel, got error: {:?}", e),
         }
     }
 
-    async fn expect_new_subchannel(rx: &mpsc::Receiver<TestEvent>) -> Arc<dyn Subchannel> {
-        let event = recv_async(rx).await;
-        match event {
-            TestEvent::NewSubchannel(sc) => sc,
-            other => panic!("expected NewSubchannel, got {:?}", other),
+    fn expect_connect(rx: &mpsc::Receiver<TestEvent>) -> Address {
+        match rx.try_recv() {
+            Ok(TestEvent::Connect(addr)) => addr,
+            Ok(other) => panic!("expected Connect, got {:?}", other),
+            Err(e) => panic!("expected Connect, got error: {:?}", e),
         }
     }
 
-    async fn expect_connect(rx: &mpsc::Receiver<TestEvent>) -> Address {
-        let event = recv_async(rx).await;
-        match event {
-            TestEvent::Connect(addr) => addr,
-            other => panic!("expected Connect, got {:?}", other),
+    fn expect_picker_update(rx: &mpsc::Receiver<TestEvent>) -> LbState {
+        match rx.try_recv() {
+            Ok(TestEvent::UpdatePicker(state)) => state,
+            Ok(other) => panic!("expected UpdatePicker, got {:?}", other),
+            Err(e) => panic!("expected UpdatePicker, got error: {:?}", e),
         }
     }
 
-    async fn expect_picker_update(rx: &mpsc::Receiver<TestEvent>) -> LbState {
-        let event = recv_async(rx).await;
-        match event {
-            TestEvent::UpdatePicker(state) => state,
-            other => panic!("expected UpdatePicker, got {:?}", other),
+    fn expect_request_resolution(rx: &mpsc::Receiver<TestEvent>) {
+        match rx.try_recv() {
+            Ok(TestEvent::RequestResolution) => {}
+            Ok(other) => panic!("expected RequestResolution, got {:?}", other),
+            Err(e) => panic!("expected RequestResolution, got error: {:?}", e),
         }
     }
 
-    async fn expect_request_resolution(rx: &mpsc::Receiver<TestEvent>) {
-        let event = recv_async(rx).await;
-        match event {
-            TestEvent::RequestResolution => {}
-            other => panic!("expected RequestResolution, got {:?}", other),
-        }
-    }
-
-    async fn expect_schedule_work(rx: &mpsc::Receiver<TestEvent>) {
-        let event = recv_async(rx).await;
-        match event {
-            TestEvent::ScheduleWork => {}
-            other => panic!("expected ScheduleWork, got {:?}", other),
+    fn expect_schedule_work(rx: &mpsc::Receiver<TestEvent>) {
+        match rx.try_recv() {
+            Ok(TestEvent::ScheduleWork) => {}
+            Ok(other) => panic!("expected ScheduleWork, got {:?}", other),
+            Err(e) => panic!("expected ScheduleWork, got error: {:?}", e),
         }
     }
 
     // Helper to simulate a basic connection against a list of
     // addresses. Returns the event receiver for inspection. Does not imply
     // that the connection succeeded or failed.
-    async fn simulate_connection(
+    fn simulate_connection(
         addrs: Vec<&str>,
         attrs: Option<crate::attributes::Attributes>,
     ) -> (
@@ -874,18 +856,18 @@ mod test {
             .unwrap();
 
         for _ in 0..addrs_len {
-            expect_new_subchannel(&rx).await;
+            expect_new_subchannel(&rx);
         }
 
-        expect_connect(&rx).await;
+        expect_connect(&rx);
 
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
 
         (rx, policy, controller)
     }
 
-    async fn simulate_successful_connection(
+    fn simulate_successful_connection(
         addrs: Vec<&str>,
         attrs: Option<crate::attributes::Attributes>,
     ) -> (
@@ -893,7 +875,7 @@ mod test {
         PickFirstPolicy,
         Box<TestChannelController>,
     ) {
-        let (rx, mut policy, mut controller) = simulate_connection(addrs, attrs).await;
+        let (rx, mut policy, mut controller) = simulate_connection(addrs, attrs);
 
         // Simulating READY for addr1.
         let sc1 = policy.subchannels[0].clone();
@@ -908,7 +890,7 @@ mod test {
         (rx, policy, controller)
     }
 
-    async fn simulate_failed_connection(
+    fn simulate_failed_connection(
         addrs: Vec<&str>,
         attrs: Option<crate::attributes::Attributes>,
     ) -> (
@@ -916,7 +898,7 @@ mod test {
         PickFirstPolicy,
         Box<TestChannelController>,
     ) {
-        let (rx, mut policy, mut controller) = simulate_connection(addrs, attrs).await;
+        let (rx, mut policy, mut controller) = simulate_connection(addrs, attrs);
 
         // Simulating TransientFailure for addr1.
         let sc1 = policy.subchannels[0].clone();
@@ -936,10 +918,10 @@ mod test {
     #[tokio::test]
     async fn test_pick_first_basic_connection() {
         let addrs = vec!["addr1", "addr2"];
-        let (rx, _, _) = simulate_successful_connection(addrs, None).await;
+        let (rx, _, _) = simulate_successful_connection(addrs, None);
 
         // Should update picker to READY with sc1.
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(state.connectivity_state, ConnectivityState::Ready);
         let res = state.picker.pick(&RequestHeaders::default());
         match res {
@@ -954,10 +936,10 @@ mod test {
     #[tokio::test]
     async fn test_pick_first_failover() {
         let (rx, mut policy, mut controller) =
-            simulate_failed_connection(vec!["addr1", "addr2"], None).await;
+            simulate_failed_connection(vec!["addr1", "addr2"], None);
 
         // Should connect to addr2.
-        let addr = expect_connect(&rx).await;
+        let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr2");
 
         // Simulate addr2 succeeding.
@@ -971,7 +953,7 @@ mod test {
             controller.as_mut(),
         );
 
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(state.connectivity_state, ConnectivityState::Ready);
     }
 
@@ -981,10 +963,10 @@ mod test {
     #[tokio::test]
     async fn test_pick_first_stickiness() {
         let (rx, mut policy, mut controller) =
-            simulate_successful_connection(vec!["addr1", "addr2"], None).await;
+            simulate_successful_connection(vec!["addr1", "addr2"], None);
 
         // Expect `UpdatePicker(Ready)`.
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(state.connectivity_state, ConnectivityState::Ready);
 
         // New resolver update including addr1.
@@ -1001,10 +983,10 @@ mod test {
             .unwrap();
 
         // Should create new subchannel for addr2 (was cleared by cleanup).
-        let sc2 = expect_new_subchannel(&rx).await;
+        let sc2 = expect_new_subchannel(&rx);
         assert_eq!(sc2.address().address.to_string(), "addr2");
         // Should create new subchannel for addr3 (was not in previous list).
-        let sc3 = expect_new_subchannel(&rx).await;
+        let sc3 = expect_new_subchannel(&rx);
         assert_eq!(sc3.address().address.to_string(), "addr3");
 
         // Should NOT have any more events (no Connect, no UpdatePicker),
@@ -1028,17 +1010,17 @@ mod test {
     // TransientFailure and request re-resolution.
     #[tokio::test]
     async fn test_pick_first_exhaustion() {
-        let (rx, policy, controller) = simulate_failed_connection(vec!["addr1"], None).await;
+        let (rx, policy, controller) = simulate_failed_connection(vec!["addr1"], None);
 
         // Should update picker to TransientFailure.
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(
             state.connectivity_state,
             ConnectivityState::TransientFailure
         );
 
         // Should request re-resolution.
-        expect_request_resolution(&rx).await;
+        expect_request_resolution(&rx);
     }
 
     // Shuffling and interleaving of addresses is deterministic and correct
@@ -1104,7 +1086,7 @@ mod test {
         const NUM_ADDRS: usize = 4;
         let mut resulting_addrs = Vec::with_capacity(NUM_ADDRS);
         for _ in 0..NUM_ADDRS {
-            let sc = expect_new_subchannel(&rx).await;
+            let sc = expect_new_subchannel(&rx);
             resulting_addrs.push(sc.address().address.to_string());
         }
 
@@ -1173,9 +1155,9 @@ mod test {
             .unwrap();
 
         // Should only create subchannels for addr1 and addr2 (2 unique addrs).
-        let sc1 = expect_new_subchannel(&rx).await;
+        let sc1 = expect_new_subchannel(&rx);
         assert_eq!(sc1.address().address.to_string(), "addr1");
-        let sc2 = expect_new_subchannel(&rx).await;
+        let sc2 = expect_new_subchannel(&rx);
         assert_eq!(sc2.address().address.to_string(), "addr2");
 
         // Verify no 3rd subchannel was created.
@@ -1194,10 +1176,10 @@ mod test {
     #[tokio::test]
     async fn test_pick_first_empty_update_clears_state() {
         let (rx, mut policy, mut controller) =
-            simulate_successful_connection(vec!["addr1", "addr2"], None).await;
+            simulate_successful_connection(vec!["addr1", "addr2"], None);
 
         // Verify that the policy produced a picker that was READY.
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(state.connectivity_state, ConnectivityState::Ready);
 
         while rx.try_recv().is_ok() {}
@@ -1215,14 +1197,14 @@ mod test {
         assert!(res.is_err());
 
         // Check picker is in TransientFailure.
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(
             state.connectivity_state,
             ConnectivityState::TransientFailure
         );
 
         // Check that re-resolution was requested.
-        expect_request_resolution(&rx).await;
+        expect_request_resolution(&rx);
     }
 
     // If the timer expires during a connection pass, the LB should advance to
@@ -1230,7 +1212,7 @@ mod test {
     #[tokio::test]
     async fn test_pick_first_timer_advancement() {
         let (rx, mut policy, mut controller) =
-            simulate_connection(vec!["addr1", "addr2"], None).await;
+            simulate_connection(vec!["addr1", "addr2"], None);
 
         // Simulate timer expiration by setting the flag directly.
         policy
@@ -1244,7 +1226,7 @@ mod test {
         policy.work(controller.as_mut());
 
         // Expect Connect event for addr2 due to timer expiration.
-        let addr = expect_connect(&rx).await;
+        let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr2");
     }
 
@@ -1253,16 +1235,16 @@ mod test {
     #[tokio::test]
     async fn test_pick_first_steady_state_retries() {
         let (rx, mut policy, mut controller) =
-            simulate_failed_connection(vec!["addr1"], None).await;
+            simulate_failed_connection(vec!["addr1"], None);
         let sc1 = policy.subchannels[0].clone();
 
         // Expect UpdatePicker(TransientFailure) and RequestResolution.
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(
             state.connectivity_state,
             ConnectivityState::TransientFailure
         );
-        expect_request_resolution(&rx).await;
+        expect_request_resolution(&rx);
 
         // Ensure steady state was entered.
         assert!(policy.steady_state.is_some());
@@ -1278,7 +1260,7 @@ mod test {
         );
 
         // Should automatically call connect() again.
-        let addr = expect_connect(&rx).await;
+        let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr1");
     }
 
@@ -1289,11 +1271,11 @@ mod test {
     #[tokio::test]
     async fn test_pick_first_steady_state_multi_backend() {
         let (rx, mut policy, mut controller) =
-            simulate_failed_connection(vec!["addr1", "addr2"], None).await;
+            simulate_failed_connection(vec!["addr1", "addr2"], None);
         let sc1 = policy.subchannels[0].clone();
 
         // Should failover to addr2: expect Connect(addr2).
-        let addr = expect_connect(&rx).await;
+        let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr2");
 
         // While addr2 is connecting, simulate addr1 going IDLE (backoff over).
@@ -1323,13 +1305,13 @@ mod test {
         );
 
         // Expect UpdatePicker(TransientFailure), RequestResolution, and Connect(addr1) from first pass exhaustion.
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(
             state.connectivity_state,
             ConnectivityState::TransientFailure
         );
-        expect_request_resolution(&rx).await;
-        let addr = expect_connect(&rx).await;
+        expect_request_resolution(&rx);
+        let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr1");
 
         // Confirm LB is in steady state.
@@ -1346,7 +1328,7 @@ mod test {
         );
 
         // Now it should automatically call connect() again.
-        let addr = expect_connect(&rx).await;
+        let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr1");
 
         // Simulate addr1 successfully connecting and becoming READY.
@@ -1360,7 +1342,7 @@ mod test {
         );
 
         // The policy should switch to it immediately (enter READY state).
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(state.connectivity_state, ConnectivityState::Ready);
         let res = state.picker.pick(&RequestHeaders::default());
         match res {
@@ -1379,11 +1361,11 @@ mod test {
     #[tokio::test]
     async fn test_pick_first_steady_state_stuck_idle_prevention() {
         let (rx, mut policy, mut controller) =
-            simulate_failed_connection(vec!["addr1", "addr2"], None).await;
+            simulate_failed_connection(vec!["addr1", "addr2"], None);
         let sc1 = policy.subchannels[0].clone();
 
         // Expect Connect(addr2).
-        let addr = expect_connect(&rx).await;
+        let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr2");
 
         // Simulate addr1 backing off and transitioning to IDLE early
@@ -1414,16 +1396,16 @@ mod test {
 
         // Expect UpdatePicker(TransientFailure) and RequestResolution from
         // exhaustion.
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(
             state.connectivity_state,
             ConnectivityState::TransientFailure
         );
-        expect_request_resolution(&rx).await;
+        expect_request_resolution(&rx);
 
         // Expect an immediate Connect(addr1) event triggered by the exhaustion
         // loop sweeping up the early IDLE subchannel.
-        let addr = expect_connect(&rx).await;
+        let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr1");
     }
 
@@ -1434,7 +1416,7 @@ mod test {
     #[tokio::test]
     async fn test_pick_first_address_update_with_attributes() {
         let addr = "addr1";
-        let (rx, mut policy, mut controller) = simulate_connection(vec![addr], None).await;
+        let (rx, mut policy, mut controller) = simulate_connection(vec![addr], None);
 
         // Push same address but with attributes.
         let attrs = crate::attributes::Attributes::new().add("metadata_value".to_string());
@@ -1474,7 +1456,7 @@ mod test {
     // unnecessary disruption to active connection attempts.
     #[tokio::test]
     async fn test_pick_first_resolver_error_during_connecting() {
-        let (rx, mut policy, mut controller) = simulate_connection(vec!["addr1"], None).await;
+        let (rx, mut policy, mut controller) = simulate_connection(vec!["addr1"], None);
 
         // Simulate resolver error arriving.
         let resolver_error = "dns resolution failed".to_string();
@@ -1512,7 +1494,7 @@ mod test {
     #[tokio::test]
     async fn test_pick_first_happy_eyeballs_out_of_order_failure() {
         let (rx, mut policy, mut controller) =
-            simulate_connection(vec!["addr1", "addr2"], None).await;
+            simulate_connection(vec!["addr1", "addr2"], None);
 
         // 1. Simulate Happy Eyeballs timer firing to launch parallel connection
         // to addr2.
@@ -1524,7 +1506,7 @@ mod test {
             .store(true, Ordering::SeqCst);
         policy.work(controller.as_mut());
 
-        let addr = expect_connect(&rx).await;
+        let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr2");
 
         // 2. Simulate addr2 failing first while addr1 is still in flight.
@@ -1553,7 +1535,7 @@ mod test {
             controller.as_mut(),
         );
 
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(
             state.connectivity_state,
             ConnectivityState::TransientFailure
@@ -1566,15 +1548,15 @@ mod test {
     #[tokio::test]
     async fn test_pick_first_steady_state_freshest_error() {
         let (rx, mut policy, mut controller) =
-            simulate_failed_connection(vec!["addr1"], None).await;
+            simulate_failed_connection(vec!["addr1"], None);
 
         // Consume exhaustion events.
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(
             state.connectivity_state,
             ConnectivityState::TransientFailure
         );
-        expect_request_resolution(&rx).await;
+        expect_request_resolution(&rx);
         assert!(policy.steady_state.is_some());
 
         // Simulate background failure during Steady State with net-new error telemetry.
@@ -1602,10 +1584,10 @@ mod test {
     #[tokio::test]
     async fn test_pick_first_disconnect_to_idle_and_reconnect() {
         let (rx, mut policy, mut controller) =
-            simulate_successful_connection(vec!["addr1"], None).await;
+            simulate_successful_connection(vec!["addr1"], None);
 
         // 1. Consume the initial Ready picker update.
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(state.connectivity_state, ConnectivityState::Ready);
         let res = state.picker.pick(&RequestHeaders::default());
         let sc1 = match res {
@@ -1627,7 +1609,7 @@ mod test {
         );
 
         // 3. Verify the policy updates the picker to Idle state.
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(state.connectivity_state, ConnectivityState::Idle);
         let idle_picker = state.picker;
 
@@ -1640,17 +1622,17 @@ mod test {
         assert!(matches!(pick_result, PickResult::Queue));
 
         // 5. The picker should schedule work.
-        expect_schedule_work(&rx).await;
+        expect_schedule_work(&rx);
 
         // 6. Call work to execute the scheduled connection attempt.
         policy.work(controller.as_mut());
 
         // 7. Verify that the policy initiates a reconnection to addr1.
-        let addr = expect_connect(&rx).await;
+        let addr = expect_connect(&rx);
         assert_eq!(addr.address.to_string(), "addr1");
 
         // And the picker goes to Connecting.
-        let state = expect_picker_update(&rx).await;
+        let state = expect_picker_update(&rx);
         assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
     }
 }
