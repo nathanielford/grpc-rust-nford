@@ -196,6 +196,28 @@ impl<T: ChannelCredentials> ChannelCredentials for CompositeChannelCredentials<T
     }
 }
 
+impl<T> crate::credentials::dyn_wrapper::IntoDynChannelCredentials
+    for CompositeChannelCredentials<T>
+where
+    T: ChannelCredentials + 'static,
+    T::Output<crate::rt::BoxEndpoint>: crate::rt::GrpcEndpoint,
+{
+    fn into_dyn_creds(self) -> Arc<dyn crate::credentials::dyn_wrapper::DynChannelCredentials> {
+        Arc::new(self) as Arc<dyn crate::credentials::dyn_wrapper::DynChannelCredentials>
+    }
+}
+
+impl<T> crate::credentials::dyn_wrapper::IntoDynChannelCredentials
+    for Arc<CompositeChannelCredentials<T>>
+where
+    T: ChannelCredentials + 'static,
+    T::Output<crate::rt::BoxEndpoint>: crate::rt::GrpcEndpoint,
+{
+    fn into_dyn_creds(self) -> Arc<dyn crate::credentials::dyn_wrapper::DynChannelCredentials> {
+        self as Arc<dyn crate::credentials::dyn_wrapper::DynChannelCredentials>
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::net::TcpListener;

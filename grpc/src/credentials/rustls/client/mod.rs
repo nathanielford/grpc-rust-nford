@@ -280,3 +280,15 @@ impl ChannelCredentials for RustlsChannelCredendials {
         None
     }
 }
+
+impl crate::credentials::dyn_wrapper::IntoDynChannelCredentials for RustlsChannelCredendials {
+    fn into_dyn_creds(self) -> Arc<dyn crate::credentials::dyn_wrapper::DynChannelCredentials> {
+        Arc::new(self) as Arc<dyn crate::credentials::dyn_wrapper::DynChannelCredentials>
+    }
+}
+
+impl crate::credentials::dyn_wrapper::IntoDynChannelCredentials for Arc<RustlsChannelCredendials> {
+    fn into_dyn_creds(self) -> Arc<dyn crate::credentials::dyn_wrapper::DynChannelCredentials> {
+        self as Arc<dyn crate::credentials::dyn_wrapper::DynChannelCredentials>
+    }
+}

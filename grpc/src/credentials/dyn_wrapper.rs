@@ -44,7 +44,7 @@ type BoxEndpoint = Box<dyn GrpcEndpoint>;
 
 // Bridge trait for type erasure.
 #[async_trait]
-pub(crate) trait DynChannelCredentials: Send + Sync {
+pub trait DynChannelCredentials: Send + Sync {
     async fn dyn_connect(
         &self,
         authority: &Authority,
@@ -118,6 +118,16 @@ impl ChannelCredentials for Arc<dyn DynChannelCredentials> {
 
     fn info(&self) -> &ProtocolInfo {
         (**self).info()
+    }
+}
+
+pub trait IntoDynChannelCredentials {
+    fn into_dyn_creds(self) -> Arc<dyn DynChannelCredentials>;
+}
+
+impl IntoDynChannelCredentials for Arc<dyn DynChannelCredentials> {
+    fn into_dyn_creds(self) -> Arc<dyn DynChannelCredentials> {
+        self
     }
 }
 
