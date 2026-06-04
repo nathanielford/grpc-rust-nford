@@ -152,6 +152,13 @@ pub struct ChannelBuilder<C, R> {
     runtime: R, // Can be defaulted w/Tokio runtime feature.
 
     // Optional values.
+    // TODO(nford) In follow-up implement the following optional values:
+    // - default_service_config
+    // - http_proxy_cfg
+    // - disable_health_checks
+    // - idle_timeout
+    // - enable_channelz
+    // - keepalive_cfg
     channel_authority: Option<String>, // TODO(nford) Revist if this is subsumed by the SecurityOpts authority.
 }
 
