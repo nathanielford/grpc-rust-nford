@@ -249,11 +249,9 @@ async fn grpc_invoke_tonic_unary() {
 
     // Create the channel.
     let target = format!("dns:///{}", addr);
-    let channel = Channel::new(
-        &target,
-        LocalChannelCredentials::new_arc(),
-        Default::default(),
-    );
+    let channel = Channel::builder(&target)
+        .credentials(LocalChannelCredentials::new_arc())
+        .build();
 
     let (_, resp, trailers) = perform_unary_echo(&channel, "hello interop").await;
     assert_eq!(resp.message, "hello interop");
@@ -281,12 +279,9 @@ mod unix_tests {
 
     async fn run_unix_test(bind_path: &PathBuf, target: &str) {
         let listener = UnixListener::bind(bind_path).unwrap();
-
-        let channel = Channel::new(
-            target,
-            LocalChannelCredentials::new_arc(),
-            Default::default(),
-        );
+        let channel = Channel::builder(target)
+            .credentials(LocalChannelCredentials::new_arc())
+            .build();
 
         let shutdown_notify = Arc::new(Notify::new());
         let shutdown_notify_copy = shutdown_notify.clone();
@@ -457,7 +452,9 @@ async fn grpc_invoke_tonic_unary_tls() {
     let composite_creds = CompositeChannelCredentials::new(creds, call_creds);
 
     let target = format!("dns:///{}", addr);
-    let channel = Channel::new(&target, Arc::new(composite_creds), Default::default());
+    let channel = Channel::builder(&target)
+        .credentials(Arc::new(composite_creds))
+        .build();
 
     let (headers, resp, trilers) = perform_unary_echo(&channel, "hello interop tls").await;
     assert_eq!(
@@ -509,7 +506,9 @@ async fn grpc_invoke_failure_cases() {
             should_fail: None,
         });
         let composite_creds = CompositeChannelCredentials::new(creds, call_creds);
-        let channel = Channel::new(&target, Arc::new(composite_creds), Default::default());
+        let channel = Channel::builder(&target)
+            .credentials(Arc::new(composite_creds))
+            .build();
 
         let trailers = perform_unary_echo_failure(&channel).await;
         assert_eq!(
@@ -530,7 +529,9 @@ async fn grpc_invoke_failure_cases() {
             )),
         });
         let composite_creds = CompositeChannelCredentials::new(creds, call_creds);
-        let channel = Channel::new(&target, Arc::new(composite_creds), Default::default());
+        let channel = Channel::builder(&target)
+            .credentials(Arc::new(composite_creds))
+            .build();
 
         let trailers = perform_unary_echo_failure(&channel).await;
         assert_eq!(
@@ -559,7 +560,9 @@ async fn grpc_invoke_failure_cases() {
             )),
         });
         let composite_creds = CompositeChannelCredentials::new(creds, call_creds);
-        let channel = Channel::new(&target, Arc::new(composite_creds), Default::default());
+        let channel = Channel::builder(&target)
+            .credentials(Arc::new(composite_creds))
+            .build();
 
         let trailers = perform_unary_echo_failure(&channel).await;
         assert_eq!(

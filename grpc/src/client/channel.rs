@@ -29,9 +29,7 @@ use std::error::Error;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
 use std::time::Instant;
-use std::vec;
 
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -40,7 +38,6 @@ use url::Url; // NOTE: http::Uri requires non-empty authority portion of URI
 
 use crate::StatusCodeError;
 use crate::StatusError;
-use crate::attributes::Attributes;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
 use crate::client::DynInvoke;
@@ -80,77 +77,12 @@ use crate::client::transport::TransportRegistry;
 #[cfg(feature = "_runtime-tokio")]
 use crate::client::transport::tonic as tonic_transport;
 use crate::core::RequestHeaders;
-use crate::credentials::ChannelCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
 use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::rt;
-use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 use crate::rt::default_runtime;
-
-/// Configuration options for [`Channel`]s.
-#[non_exhaustive]
-pub struct ChannelOptions {
-    pub(crate) transport_options: Attributes, // ?
-    pub(crate) channel_authority: Option<String>,
-    pub(crate) connection_backoff: Option<Todo>,
-    pub(crate) default_service_config: Option<String>,
-    pub(crate) disable_proxy: bool,
-    pub(crate) disable_service_config_lookup: bool,
-    pub(crate) disable_health_checks: bool,
-    pub(crate) max_retry_memory: u32, // ?
-    pub(crate) idle_timeout: Duration,
-    // TODO: pub transport_registry: Option<TransportRegistry>,
-    // TODO: pub name_resolver_registry: Option<ResolverRegistry>,
-    // TODO: pub lb_policy_registry: Option<LbPolicyRegistry>,
-
-    // Typically we allow settings at the channel level that impact all RPCs,
-    // but can also be set per-RPC.  E.g.s:
-    //
-    // - interceptors
-    // - user-agent string override
-    // - max message sizes
-    // - max retry/hedged attempts
-    // - disable retry
-    //
-    // In gRPC-Go, we can express CallOptions as DialOptions, which is a nice
-    // pattern: https://pkg.go.dev/google.golang.org/grpc#WithDefaultCallOptions
-    //
-    // To do this in rust, all optional behavior for a request would need to be
-    // expressed through a trait that applies a mutation to a request.  We'd
-    // apply all those mutations before the user's options so the user's options
-    // would override the defaults, or so the defaults would occur first.
-    pub(crate) default_request_extensions: Vec<Todo>, // ??
-}
-
-impl Default for ChannelOptions {
-    fn default() -> Self {
-        Self {
-            transport_options: Attributes::default(),
-            channel_authority: None,
-            connection_backoff: None,
-            default_service_config: None,
-            disable_proxy: false,
-            disable_service_config_lookup: false,
-            disable_health_checks: false,
-            max_retry_memory: 8 * 1024 * 1024, // 8MB -- ???
-            idle_timeout: Duration::from_secs(30 * 60),
-            default_request_extensions: vec![],
-        }
-    }
-}
-
-impl ChannelOptions {
-    /// Overrides the channel authority, which is used for credentials
-    /// handshaking and HTTP virtual hosting.
-    pub fn override_authority(self, authority: impl Into<String>) -> Self {
-        Self {
-            channel_authority: Some(authority.into()),
-            ..self
-        }
-    }
-}
 
 /// A virtual, persistent connection to a gRPC service.
 ///
@@ -164,33 +96,14 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Constructs a new gRPC channel.  Channel creation cannot fail, but if the
-    /// target string is invalid, the returned channel will never connect, and
-    /// will fail all RPCs.
-    pub fn new<C>(target: impl Into<String>, credentials: Arc<C>, options: ChannelOptions) -> Self
-    where
-        C: ChannelCredentials,
-        C::Output<Box<dyn GrpcEndpoint>>: GrpcEndpoint + 'static,
-    {
-        pick_first::reg();
-        round_robin::reg();
-        dns::reg();
-        #[cfg(unix)]
-        name_resolution::unix::reg();
-        #[cfg(target_os = "linux")]
-        name_resolution::unix_abstract::reg();
-        #[cfg(feature = "_runtime-tokio")]
-        tonic_transport::reg();
-        Self {
-            inner: Arc::new(PersistentChannel::new(
-                target,
-                default_runtime(),
-                options,
-                credentials as Arc<dyn DynChannelCredentials>,
-            )),
+    pub(crate) fn builder(target: impl Into<String>) -> ChannelBuilder<MissingOpt, MissingOpt> {
+        ChannelBuilder {
+            target: target.into(),
+            credentials: MissingOpt,
+            runtime: MissingOpt,
+            channel_authority: None,
         }
     }
-
     // TODO: enter_idle(&self) and graceful_stop()?
 
     /// Returns the current state of the channel. If `connect` is true and the
@@ -225,54 +138,113 @@ impl Invoke for Channel {
     }
 }
 
-// A PersistentChannel represents the static configuration of a channel and an
-// optional Arc of an ActiveChannel.  An ActiveChannel exists whenever the
-// PersistentChannel is not IDLE.  Every channel is IDLE at creation, or after
-// some configurable timeout elapses without any any RPC activity.
-struct PersistentChannel {
-    target: Target,
-    resolver_builder: Arc<dyn ResolverBuilder>,
-    options: ChannelOptions,
-    active_channel: Mutex<Option<Arc<ActiveChannel>>>,
-    runtime: GrpcRuntime,
-    security_opts: SecurityOpts,
-    authority: String,
+pub struct MissingOpt;
+pub struct PresentOpt<T>(pub T);
+
+type PresentCredentials = PresentOpt<Arc<dyn DynChannelCredentials>>;
+type PresentRuntime = PresentOpt<GrpcRuntime>;
+
+pub struct ChannelBuilder<C, R> {
+    // Required values.
+    target: String,
+    credentials: C,
+    runtime: R, // Can be defaulted w/Tokio runtime feature.
+
+    // Optional values.
+    channel_authority: Option<String>,
 }
 
-impl PersistentChannel {
-    // Channels begin idle so `new()` does not automatically connect.
-    // ChannelOption contain only optional parameters.
-    fn new(
-        target: impl Into<String>,
-        runtime: GrpcRuntime,
-        options: ChannelOptions,
+/// Impl for adding the required credentials to the builder.
+// This is provided as a separate builder function to allow for the possibility
+// of satisfying the credential/security configuration through different means
+// in the future (via adding methods to this impl taking different args).
+impl<Runtime> ChannelBuilder<MissingOpt, Runtime> {
+    pub fn credentials(
+        self,
         credentials: Arc<dyn DynChannelCredentials>,
-    ) -> Self {
-        // TODO(arjan-bal): Return errors here instead of panicking.
-        let target = Url::from_str(&target.into()).unwrap();
+    ) -> ChannelBuilder<PresentCredentials, Runtime> {
+        ChannelBuilder {
+            target: self.target,
+            credentials: PresentOpt(credentials.into()),
+            runtime: self.runtime,
+            channel_authority: self.channel_authority,
+        }
+    }
+}
+
+/// Impl for adding the required runtime to the builder. If the Tokio runtime
+/// feature is enabled, skipping this will cause the default Tokio runtime to be
+/// used.
+impl<C> ChannelBuilder<C, MissingOpt> {
+    pub fn runtime(self, runtime: GrpcRuntime) -> ChannelBuilder<C, PresentRuntime> {
+        ChannelBuilder {
+            target: self.target,
+            credentials: self.credentials,
+            runtime: PresentOpt(runtime),
+            channel_authority: self.channel_authority,
+        }
+    }
+}
+
+/// If the Tokio runtime feature is enabled, the channel builder can be built
+/// without explicitly providing a runtime, defaulting to the Tokio runtime.
+/// This does not prevent a user from providing their own runtime if they wish,
+/// and the builder will work as normal.
+#[cfg(feature = "_runtime-tokio")]
+impl ChannelBuilder<PresentCredentials, MissingOpt> {
+    pub fn build(self) -> Channel {
+        self.runtime(default_runtime()).build()
+    }
+}
+
+impl ChannelBuilder<PresentCredentials, PresentRuntime> {
+    pub fn build(self) -> Channel {
+        // TODO(nford) This construction is currently a rough-cut placeholder.
+        // The design of PersistentChannel and how and where it is initialized
+        // will be finalized with the 'Internal Channel Design' with
+        // consideration for:
+        // - error handling (inc. always-failing resolvers due to invalid targets))
+        // - testing (inc. credential and transport configuration)
+
+        // TODO(nford) Find a better place to set up default registries.
+        setup_registers();
+
+        let target = Url::from_str(self.target.as_str()).unwrap();
         let resolver_builder = global_registry().get(target.scheme()).unwrap();
         let target = name_resolution::Target::from(target);
-        let authority = options
+        let authority = self
             .channel_authority
-            .clone()
             .unwrap_or_else(|| resolver_builder.default_authority(&target).to_owned());
         let security_opts = SecurityOpts {
-            credentials,
+            credentials: self.credentials.0,
             authority: parse_authority(&authority),
             handshake_info: ClientHandshakeInfo::default(),
         };
-
-        Self {
-            target,
-            resolver_builder,
-            active_channel: Mutex::default(),
-            options,
-            runtime,
-            security_opts,
-            authority,
+        Channel {
+            inner: Arc::new(PersistentChannel {
+                active_channel: Mutex::default(),
+                target: target,
+                security_opts: security_opts,
+                runtime: self.runtime.0,
+                resolver_builder,
+            }),
         }
     }
+}
 
+struct PersistentChannel {
+    active_channel: Mutex<Option<Arc<ActiveChannel>>>,
+
+    // Configuration
+    target: Target,
+    security_opts: SecurityOpts,
+    runtime: GrpcRuntime,
+
+    // Inferred Configuration
+    resolver_builder: Arc<dyn ResolverBuilder>,
+}
+
+impl PersistentChannel {
     /// Returns the current state of the channel. If there is no underlying active channel,
     /// returns Idle. If `connect` is true, will create a new active channel iff none exists.
     fn get_state(&self, connect: bool) -> ConnectivityState {
@@ -329,7 +301,8 @@ impl ActiveChannel {
 
         let work_scheduler = Arc::new(ResolverWorkScheduler { wqtx });
         let resolver_opts = name_resolution::ResolverOptions {
-            authority: persistent_channel.authority.clone(),
+            // authority: persistent_channel.security_opts.authority.clone(),
+            authority: "ignored".to_string(), // TODO(nford) currently, this option is always ignored.
             work_scheduler,
             runtime: runtime.clone(),
         };
@@ -619,6 +592,18 @@ fn parse_authority(host_and_port: &str) -> Authority {
         return Authority::new(host, Some(port));
     }
     Authority::new(host_and_port.to_string(), None)
+}
+
+fn setup_registers() {
+    pick_first::reg();
+    round_robin::reg();
+    dns::reg();
+    #[cfg(unix)]
+    name_resolution::unix::reg();
+    #[cfg(target_os = "linux")]
+    name_resolution::unix_abstract::reg();
+    #[cfg(feature = "_runtime-tokio")]
+    tonic_transport::reg();
 }
 
 #[cfg(test)]

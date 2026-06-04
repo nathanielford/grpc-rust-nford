@@ -183,6 +183,9 @@ pub(crate) struct ResolverOptions {
     /// This value is either the result of the `default_authority` method of
     /// this `ResolverBuilder`, or another string if the channel was explicitly
     /// configured to override the default.
+    // TODO(nford): This field is currently unused. When/if it is needed ensure the type is appropriate.
+    // - Channels reference SecurityOpts, which hold the value in an Authority object.
+    // - All other references currently use "ignored" as the authority.
     pub authority: String,
 
     /// The runtime which provides utilities to do async work.
