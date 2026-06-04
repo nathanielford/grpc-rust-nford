@@ -82,6 +82,7 @@ use crate::credentials::common::Authority;
 use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::rt;
 use crate::rt::GrpcRuntime;
+#[cfg(feature = "_runtime-tokio")]
 use crate::rt::default_runtime;
 
 /// A virtual, persistent connection to a gRPC service.
@@ -96,7 +97,7 @@ pub struct Channel {
 }
 
 impl Channel {
-    pub(crate) fn builder(target: impl Into<String>) -> ChannelBuilder<MissingOpt, MissingOpt> {
+    pub fn builder(target: impl Into<String>) -> ChannelBuilder<MissingOpt, MissingOpt> {
         ChannelBuilder {
             target: target.into(),
             credentials: MissingOpt,
@@ -159,13 +160,13 @@ pub struct ChannelBuilder<C, R> {
 // of satisfying the credential/security configuration through different means
 // in the future (via adding methods to this impl taking different args).
 impl<Runtime> ChannelBuilder<MissingOpt, Runtime> {
-    pub fn credentials(
-        self,
-        credentials: Arc<dyn DynChannelCredentials>,
-    ) -> ChannelBuilder<PresentCredentials, Runtime> {
+    pub fn credentials<C>(self, credentials: C) -> ChannelBuilder<PresentCredentials, Runtime>
+    where
+        C: crate::credentials::dyn_wrapper::IntoDynChannelCredentials,
+    {
         ChannelBuilder {
             target: self.target,
-            credentials: PresentOpt(credentials.into()),
+            credentials: PresentOpt(credentials.into_dyn_creds()),
             runtime: self.runtime,
             channel_authority: self.channel_authority,
         }
