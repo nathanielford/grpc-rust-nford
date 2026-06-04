@@ -233,8 +233,8 @@ impl ChannelBuilder<PresentCredentials, PresentRuntime> {
         Channel {
             inner: Arc::new(PersistentChannel {
                 active_channel: Mutex::default(),
-                target: target,
-                security_opts: security_opts,
+                target,
+                security_opts,
                 runtime: self.runtime.0,
                 resolver_builder,
             }),

@@ -1,8 +1,6 @@
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 
-use grpc::client::ChannelOptions;
 use grpc::credentials::LocalChannelCredentials;
 use grpc::credentials::rustls::RootCertificates;
 use grpc::credentials::rustls::StaticProvider;
