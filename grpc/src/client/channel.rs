@@ -155,7 +155,7 @@ pub struct ChannelBuilder<C, R> {
     channel_authority: Option<String>, // TODO(nford) Revist if this is subsumed by the SecurityOpts authority.
 }
 
-/// Impl for adding the required credentials to the builder.
+/// Impl for adding the (required) credentials to the builder.
 // This is provided as a separate builder function to allow for the possibility
 // of satisfying the credential/security configuration through different means
 // in the future (via adding methods to this impl taking different args).
@@ -173,7 +173,7 @@ impl<Runtime> ChannelBuilder<MissingOpt, Runtime> {
     }
 }
 
-/// Impl for adding the required runtime to the builder. If the Tokio runtime
+/// Impl for adding the (required) runtime to the builder. If the Tokio runtime
 /// feature is enabled, skipping this will cause the default Tokio runtime to be
 /// used.
 impl<C> ChannelBuilder<C, MissingOpt> {
@@ -217,7 +217,7 @@ impl ChannelBuilder<PresentCredentials, PresentRuntime> {
         // - testing (inc. credential and transport configuration)
 
         // TODO(nford) Find a better place to set up default registries.
-        setup_registers();
+        setup_registeries();
 
         let target = Url::from_str(self.target.as_str()).unwrap();
         let resolver_builder = global_registry().get(target.scheme()).unwrap();
@@ -604,7 +604,9 @@ fn parse_authority(host_and_port: &str) -> Authority {
     Authority::new(host_and_port.to_string(), None)
 }
 
-fn setup_registers() {
+// Sets up the default registries for transports, name resolvers, and load
+// balancers.
+fn setup_registeries() {
     pick_first::reg();
     round_robin::reg();
     dns::reg();
