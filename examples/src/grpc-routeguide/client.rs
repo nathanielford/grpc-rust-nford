@@ -11,7 +11,6 @@ use std::env;
 use std::sync::Arc;
 
 use grpc::client::Channel;
-use grpc::client::ChannelOptions;
 use grpc::client::Invoke;
 use grpc::credentials::LocalChannelCredentials;
 use tokio::task;
@@ -180,11 +179,10 @@ async fn main() {
     println!("Connecting to {address}...");
 
     // Create a new gRPC channel:
-    let channel = Channel::new(
-        format!("dns:///{address}"),
-        Arc::new(LocalChannelCredentials::new()),
-        ChannelOptions::default(),
-    );
+    let channel = Channel::builder(format!("dns:///{address}"))
+        .credentials(Arc::new(LocalChannelCredentials::new()))
+        .build();
+
     let client = RouteGuideClient::new(channel);
 
     println!("*** SIMPLE RPC ***");
