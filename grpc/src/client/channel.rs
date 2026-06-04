@@ -152,7 +152,7 @@ pub struct ChannelBuilder<C, R> {
     runtime: R, // Can be defaulted w/Tokio runtime feature.
 
     // Optional values.
-    channel_authority: Option<String>,
+    channel_authority: Option<String>, // TODO(nford) Revist if this is subsumed by the SecurityOpts authority.
 }
 
 /// Impl for adding the required credentials to the builder.
@@ -184,6 +184,15 @@ impl<C> ChannelBuilder<C, MissingOpt> {
             runtime: PresentOpt(runtime),
             channel_authority: self.channel_authority,
         }
+    }
+}
+
+impl<C, R> ChannelBuilder<C, R> {
+    // TODO(nford) Revist if this is subsumed by the SecurityOpts authority.
+    // May need to change how this is being set on the builder.
+    pub fn channel_authority(mut self, authority: impl Into<String>) -> Self {
+        self.channel_authority = Some(authority.into());
+        self
     }
 }
 
