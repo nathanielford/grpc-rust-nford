@@ -79,7 +79,6 @@ use crate::client::transport::tonic as tonic_transport;
 use crate::core::RequestHeaders;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
-use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::rt;
 use crate::rt::GrpcRuntime;
 #[cfg(feature = "_runtime-tokio")]
@@ -142,7 +141,12 @@ impl Invoke for Channel {
 pub struct MissingOpt;
 pub struct PresentOpt<T>(pub T);
 
-type PresentCredentials = PresentOpt<Arc<dyn DynChannelCredentials>>;
+// An opaque struct for holding credentials provided to the builder while
+// complying with compiler public/private interface rules.
+pub struct CredentialConfig(
+    pub(crate) Arc<dyn crate::credentials::dyn_wrapper::DynChannelCredentials>,
+);
+type PresentCredentials = PresentOpt<CredentialConfig>;
 type PresentRuntime = PresentOpt<GrpcRuntime>;
 
 pub struct ChannelBuilder<C, R> {
@@ -174,7 +178,7 @@ impl<Runtime> ChannelBuilder<MissingOpt, Runtime> {
     {
         ChannelBuilder {
             target: self.target,
-            credentials: PresentOpt(credentials),
+            credentials: PresentOpt(CredentialConfig(credentials)),
             runtime: self.runtime,
             channel_authority: self.channel_authority,
         }
@@ -234,7 +238,7 @@ impl ChannelBuilder<PresentCredentials, PresentRuntime> {
             .channel_authority
             .unwrap_or_else(|| resolver_builder.default_authority(&target).to_owned());
         let security_opts = SecurityOpts {
-            credentials: self.credentials.0,
+            credentials: self.credentials.0.0,
             authority: parse_authority(&authority),
             handshake_info: ClientHandshakeInfo::default(),
         };
