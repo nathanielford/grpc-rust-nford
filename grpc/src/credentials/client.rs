@@ -196,7 +196,6 @@ impl<T: ChannelCredentials> ChannelCredentials for CompositeChannelCredentials<T
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use tokio::net::TcpListener;

@@ -147,7 +147,6 @@ impl ChannelCredentials for LocalChannelCredentials {
     }
 }
 
-
 /// An implementation of [`ServerCredentials`] for local connections to pair
 /// with a client using [`LocalChannelCredentials`].
 #[derive(Debug, Clone, Default)]
