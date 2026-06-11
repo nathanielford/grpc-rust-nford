@@ -167,13 +167,14 @@ pub struct ChannelBuilder<C, R> {
 // of satisfying the credential/security configuration through different means
 // in the future (via adding methods to this impl taking different args).
 impl<Runtime> ChannelBuilder<MissingOpt, Runtime> {
-    pub fn credentials<C>(self, credentials: C) -> ChannelBuilder<PresentCredentials, Runtime>
+    pub fn credentials<C>(self, credentials: Arc<C>) -> ChannelBuilder<PresentCredentials, Runtime>
     where
-        C: crate::credentials::dyn_wrapper::IntoDynChannelCredentials,
+        C: crate::credentials::ChannelCredentials + 'static,
+        C::Output<Box<dyn crate::rt::GrpcEndpoint>>: crate::rt::GrpcEndpoint,
     {
         ChannelBuilder {
             target: self.target,
-            credentials: PresentOpt(credentials.into_dyn_creds()),
+            credentials: PresentOpt(credentials),
             runtime: self.runtime,
             channel_authority: self.channel_authority,
         }
