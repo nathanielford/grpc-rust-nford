@@ -95,7 +95,7 @@ where
     }
 }
 
-impl ChannelCredentials for Arc<dyn DynChannelCredentials> {
+impl ChannelCredentials for dyn DynChannelCredentials {
     type ContextType = Box<dyn ClientConnectionSecurityContext>;
     type Output<I> = BoxEndpoint;
 
@@ -107,13 +107,36 @@ impl ChannelCredentials for Arc<dyn DynChannelCredentials> {
         runtime: &GrpcRuntime,
         _token: private::Internal,
     ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String> {
-        (**self)
-            .dyn_connect(authority, Box::new(source), info, runtime)
+        self.dyn_connect(authority, Box::new(source), info, runtime)
             .await
     }
 
     fn get_call_credentials(&self, _: private::Internal) -> Option<&Arc<dyn CallCredentials>> {
-        (**self).get_call_credentials()
+        self.get_call_credentials()
+    }
+
+    fn info(&self) -> &ProtocolInfo {
+        self.info()
+    }
+}
+
+impl<T: ChannelCredentials + ?Sized> ChannelCredentials for Arc<T> {
+    type ContextType = T::ContextType;
+    type Output<I> = T::Output<I>;
+
+    async fn connect<Input: GrpcEndpoint>(
+        &self,
+        authority: &Authority,
+        source: Input,
+        info: &ClientHandshakeInfo,
+        runtime: &GrpcRuntime,
+        token: private::Internal,
+    ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String> {
+        (**self).connect(authority, source, info, runtime, token).await
+    }
+
+    fn get_call_credentials(&self, token: private::Internal) -> Option<&Arc<dyn CallCredentials>> {
+        (**self).get_call_credentials(token)
     }
 
     fn info(&self) -> &ProtocolInfo {
@@ -121,15 +144,6 @@ impl ChannelCredentials for Arc<dyn DynChannelCredentials> {
     }
 }
 
-pub trait IntoDynChannelCredentials {
-    fn into_dyn_creds(self) -> Arc<dyn DynChannelCredentials>;
-}
-
-impl IntoDynChannelCredentials for Arc<dyn DynChannelCredentials> {
-    fn into_dyn_creds(self) -> Arc<dyn DynChannelCredentials> {
-        self
-    }
-}
 
 // Bridge trait for type erasure.
 #[async_trait]

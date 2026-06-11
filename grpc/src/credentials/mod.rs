@@ -40,8 +40,6 @@ pub(crate) mod client;
 pub(crate) mod dyn_wrapper;
 #[doc(hidden)]
 pub use dyn_wrapper::DynChannelCredentials;
-#[doc(hidden)]
-pub use dyn_wrapper::IntoDynChannelCredentials;
 mod local;
 #[cfg(feature = "tls-rustls")]
 pub mod rustls;
