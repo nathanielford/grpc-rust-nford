@@ -146,6 +146,29 @@ pub struct PresentOpt<T>(pub T);
 pub struct CredentialConfig(
     pub(crate) Arc<dyn crate::credentials::dyn_wrapper::DynChannelCredentials>,
 );
+
+/// A trait for types that can be converted into a `CredentialConfig`.
+pub trait IntoCredentialConfig {
+    #[doc(hidden)]
+    fn into_config(self) -> CredentialConfig;
+}
+
+impl<C> IntoCredentialConfig for Arc<C>
+where
+    C: crate::credentials::ChannelCredentials + Sized + 'static,
+    C::Output<Box<dyn crate::rt::GrpcEndpoint>>: crate::rt::GrpcEndpoint,
+{
+    fn into_config(self) -> CredentialConfig {
+        CredentialConfig(self)
+    }
+}
+
+impl IntoCredentialConfig for Arc<dyn crate::credentials::dyn_wrapper::DynChannelCredentials> {
+    fn into_config(self) -> CredentialConfig {
+        CredentialConfig(self)
+    }
+}
+
 type PresentCredentials = PresentOpt<CredentialConfig>;
 type PresentRuntime = PresentOpt<GrpcRuntime>;
 
@@ -171,14 +194,11 @@ pub struct ChannelBuilder<C, R> {
 // of satisfying the credential/security configuration through different means
 // in the future (via adding methods to this impl taking different args).
 impl<Runtime> ChannelBuilder<MissingOpt, Runtime> {
-    pub fn credentials<C>(self, credentials: Arc<C>) -> ChannelBuilder<PresentCredentials, Runtime>
-    where
-        C: crate::credentials::ChannelCredentials + 'static,
-        C::Output<Box<dyn crate::rt::GrpcEndpoint>>: crate::rt::GrpcEndpoint,
+    pub fn credentials(self, credentials: impl IntoCredentialConfig) -> ChannelBuilder<PresentCredentials, Runtime>
     {
         ChannelBuilder {
             target: self.target,
-            credentials: PresentOpt(CredentialConfig(credentials)),
+            credentials: PresentOpt(credentials.into_config()),
             runtime: self.runtime,
             channel_authority: self.channel_authority,
         }

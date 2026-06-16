@@ -62,6 +62,8 @@ pub(crate) mod service_config;
 pub mod stream_util;
 
 pub use channel::Channel;
+pub use channel::CredentialConfig;
+pub use channel::IntoCredentialConfig;
 
 pub(crate) mod load_balancing;
 pub(crate) mod name_resolution;

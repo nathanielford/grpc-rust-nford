@@ -95,7 +95,7 @@ where
     }
 }
 
-impl ChannelCredentials for Arc<dyn DynChannelCredentials> {
+impl ChannelCredentials for dyn DynChannelCredentials {
     type ContextType = Box<dyn ClientConnectionSecurityContext>;
     type Output<I> = BoxEndpoint;
 
@@ -107,17 +107,42 @@ impl ChannelCredentials for Arc<dyn DynChannelCredentials> {
         runtime: &GrpcRuntime,
         _token: private::Internal,
     ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String> {
-        (**self)
-            .dyn_connect(authority, Box::new(source), info, runtime)
+        self.dyn_connect(authority, Box::new(source), info, runtime)
             .await
     }
 
     fn get_call_credentials(&self, _: private::Internal) -> Option<&Arc<dyn CallCredentials>> {
-        (**self).get_call_credentials()
+        self.get_call_credentials()
     }
 
     fn info(&self) -> &ProtocolInfo {
-        (**self).info()
+        self.info()
+    }
+}
+
+impl ChannelCredentials for Arc<dyn DynChannelCredentials> {
+    type ContextType = Box<dyn ClientConnectionSecurityContext>;
+    type Output<I> = BoxEndpoint;
+
+    async fn connect<Input: GrpcEndpoint>(
+        &self,
+        authority: &Authority,
+        source: Input,
+        info: &ClientHandshakeInfo,
+        runtime: &GrpcRuntime,
+        token: private::Internal,
+    ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String> {
+        (**self)
+            .connect(authority, source, info, runtime, token)
+            .await
+    }
+
+    fn get_call_credentials(&self, token: private::Internal) -> Option<&Arc<dyn CallCredentials>> {
+        ChannelCredentials::get_call_credentials(&**self, token)
+    }
+
+    fn info(&self) -> &ProtocolInfo {
+        ChannelCredentials::info(&**self)
     }
 }
 
@@ -272,5 +297,11 @@ mod tests {
         assert_eq!(&buf[..], b"hello dynamic grpc server");
 
         client_handle.abort();
+    }
+
+    #[test]
+    fn test_channel_builder_with_dyn_creds() {
+        let dyn_creds = LocalChannelCredentials::new_arc() as Arc<dyn DynChannelCredentials>;
+        let _builder = crate::client::Channel::builder("localhost").credentials(dyn_creds);
     }
 }
