@@ -194,8 +194,10 @@ pub struct ChannelBuilder<C, R> {
 // of satisfying the credential/security configuration through different means
 // in the future (via adding methods to this impl taking different args).
 impl<Runtime> ChannelBuilder<MissingOpt, Runtime> {
-    pub fn credentials(self, credentials: impl IntoCredentialConfig) -> ChannelBuilder<PresentCredentials, Runtime>
-    {
+    pub fn credentials(
+        self,
+        credentials: impl IntoCredentialConfig,
+    ) -> ChannelBuilder<PresentCredentials, Runtime> {
         ChannelBuilder {
             target: self.target,
             credentials: PresentOpt(credentials.into_config()),
