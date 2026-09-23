@@ -522,7 +522,7 @@ impl Picker for OneSubchannelPicker {
 /// QueuingPicker always returns Queue.  LB policies that are not actively
 /// Connecting should not use this picker.
 #[derive(Debug)]
-pub(crate) struct QueuingPicker;
+pub struct QueuingPicker;
 
 impl Picker for QueuingPicker {
     fn pick(&self, _options: PickOptions<'_>) -> PickResult {
@@ -531,7 +531,7 @@ impl Picker for QueuingPicker {
 }
 
 #[derive(Debug)]
-pub(crate) struct FailingPicker {
+pub struct FailingPicker {
     pub error: String,
 }
 
