@@ -235,8 +235,10 @@ impl LbPolicy for WeightedTargetPolicy {
             .map(|(name, cfg)| (name.clone(), cfg.weight))
             .collect();
 
-        // Always publish on resolver updates/weight changes, so reset the flag
-        // by calling child_updated().
+        // Always publish: weight changes and removed targets alter the picker
+        // even if no child reported a new state. `child_updated()` is called
+        // only to reset its flag so the next `work()`/`exit_idle()` doesn't
+        // republish.
         let _ = self.child_manager.child_updated();
 
         self.update_picker(channel_controller);
@@ -269,11 +271,6 @@ struct WeightedPicker {
 }
 
 impl WeightedPicker {
-    #[cfg(test)]
-    fn new(pickers: Vec<(u64, Arc<dyn Picker>)>) -> Self {
-        Self::new_with_sampler(pickers, Arc::new(DefaultRngSampler))
-    }
-
     fn new_with_sampler(
         pickers: Vec<(u64, Arc<dyn Picker>)>,
         sampler: Arc<dyn RngSampler>,
@@ -311,87 +308,72 @@ pub(crate) fn reg() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     use grpc::__unstable::client::load_balancing::WorkScheduler;
     use grpc::__unstable::client::load_balancing::endpoint_filtering::set_path_in_endpoint;
     use grpc::__unstable::client::load_balancing::round_robin::POLICY_NAME as RR_POLICY_NAME;
+    use grpc::__unstable::client::load_balancing::subchannel::Subchannel;
+    use grpc::__unstable::client::load_balancing::subchannel::SubchannelState;
     use grpc::__unstable::client::name_resolution::Endpoint;
     use grpc::call_attributes::CallAttributes;
     use grpc::client::RequestHeaders;
     use grpc::core::Address;
+    use serde::Serialize;
+    use serde_json::json;
 
     use super::*;
 
     #[test]
     fn parse_config() {
-        let builder = WeightedTargetBuilder::default();
+        let parse = |json: serde_json::Value| {
+            WeightedTargetBuilder::default()
+                .parse_config(&LbConfigJson::new(&json.to_string()).unwrap())
+        };
+        let rr = json!([{ RR_POLICY_NAME: {} }]);
 
-        let valid_json = serde_json::json!({
-            "targets": {
-                "t1": {
-                    "weight": 10,
-                    "childPolicy": [{ RR_POLICY_NAME: {} }]
-                },
-                "t2": {
-                    "weight": 90,
-                    "childPolicy": [{ RR_POLICY_NAME: {} }]
-                }
-            }
-        });
-        let parsed = builder
-            .parse_config(&LbConfigJson::new(&valid_json.to_string()).unwrap())
-            .expect("a valid config should parse");
-        assert_eq!(parsed.targets.len(), 2);
-        assert_eq!(parsed.targets.get("t1").unwrap().weight, 10);
-        assert_eq!(parsed.targets.get("t2").unwrap().weight, 90);
+        let cfg = parse(json!({ "targets": {
+            "t1": { "weight": 10, "childPolicy": rr },
+            "t2": { "weight": 90, "childPolicy": rr }
+        }}))
+        .expect("valid config should parse");
+        let weights: Vec<_> = cfg
+            .targets
+            .iter()
+            .map(|(name, target)| (name.as_str(), target.weight))
+            .collect();
+        assert_eq!(weights, [("t1", 10), ("t2", 90)]);
 
-        let missing_targets = serde_json::json!({});
-        let err = builder
-            .parse_config(&LbConfigJson::new(&missing_targets.to_string()).unwrap())
-            .unwrap_err();
-        assert!(err.contains("targets"));
-
-        let empty_targets = serde_json::json!({ "targets": {} });
-        let err = builder
-            .parse_config(&LbConfigJson::new(&empty_targets.to_string()).unwrap())
-            .unwrap_err();
-        assert!(err.contains("targets"));
-
-        let zero_weight = serde_json::json!({
-            "targets": {
-                "t1": {
-                    "weight": 0,
-                    "childPolicy": [{ RR_POLICY_NAME: {} }]
-                }
-            }
-        });
-        let err = builder
-            .parse_config(&LbConfigJson::new(&zero_weight.to_string()).unwrap())
-            .unwrap_err();
-        assert!(err.contains("weight"));
+        let err = |json| parse(json).expect_err("invalid config should fail to parse");
+        assert!(err(json!({})).contains("targets"));
+        assert_eq!(
+            err(json!({ "targets": {} })),
+            "weighted_target_experimental: invalid config: 'targets' must be non-empty"
+        );
+        assert_eq!(
+            err(json!({ "targets": { "t1": { "weight": 0, "childPolicy": rr } } })),
+            "weighted_target_experimental: invalid config: target 't1': weight must be greater than 0"
+        );
     }
 
     #[test]
     fn weighted_picker_partitions_weights_correctly() {
         let pickers: Vec<(u64, Arc<dyn Picker>)> = vec![
-            (20, tagged_picker("target_a")),
-            (50, tagged_picker("target_b")),
-            (100, tagged_picker("target_c")),
+            (20, mock_picker("a")),
+            (50, mock_picker("b")),
+            (100, mock_picker("c")),
         ];
+        let picker = WeightedPicker::new_with_sampler(pickers, sampler(&[0, 19, 20, 49, 50, 99]));
+        for tag in ["a", "a", "b", "b", "c", "c"] {
+            assert_picks(&picker, tag);
+        }
 
-        let sampler = Arc::new(MockSampler::new(vec![0, 19, 20, 49, 50, 99]));
-        let picker = WeightedPicker::new_with_sampler(pickers, sampler);
-
-        assert_picks_tag(&picker, "target_a");
-        assert_picks_tag(&picker, "target_a");
-        assert_picks_tag(&picker, "target_b");
-        assert_picks_tag(&picker, "target_b");
-        assert_picks_tag(&picker, "target_c");
-        assert_picks_tag(&picker, "target_c");
-
-        let default_picker = WeightedPicker::new(vec![(50, tagged_picker("target_default"))]);
-        assert_picks_tag(&default_picker, "target_default");
+        let default_picker = WeightedPicker::new_with_sampler(
+            vec![(50, mock_picker("a"))],
+            Arc::new(DefaultRngSampler),
+        );
+        assert_picks(&default_picker, "a");
     }
 
     #[test]
@@ -402,7 +384,7 @@ mod tests {
         )
     )]
     fn empty_weighted_picker_is_internal_error() {
-        let picker = WeightedPicker::new(Vec::new());
+        let picker = WeightedPicker::new_with_sampler(Vec::new(), sampler(&[]));
         let headers = RequestHeaders::new();
         let mut attrs = CallAttributes::new();
         match picker.pick(PickOptions::new(&headers, &mut attrs)) {
@@ -413,484 +395,331 @@ mod tests {
 
     #[test]
     fn resolver_update_splits_endpoints_and_injects_locality() {
-        let (mut policy, _scheduler, mut controller) = setup_test_policy(vec![15, 45]);
-
-        let config_json = serde_json::json!({
-            "targets": {
-                "locality_a": {
-                    "weight": 30,
-                    "childPolicy": [{
-                        MOCK_CHILD_POLICY_NAME: {
-                            "tag": "child_a",
-                            "initial_state": "ready"
-                        }
-                    }]
-                },
-                "locality_b": {
-                    "weight": 70,
-                    "childPolicy": [{
-                        MOCK_CHILD_POLICY_NAME: {
-                            "tag": "child_b",
-                            "initial_state": "ready"
-                        }
-                    }]
-                }
-            }
-        });
-        let cfg = WeightedTargetBuilder::default()
-            .parse_config(&LbConfigJson::new(&config_json.to_string()).unwrap())
-            .unwrap();
-
+        let mut t = Harness::new(&[0, 30]);
         let mut update = ResolverUpdate::default();
         update.endpoints = Ok(vec![
-            make_endpoint("127.0.0.1:9001", "locality_a"),
-            make_endpoint("127.0.0.1:9002", "locality_b"),
+            endpoint(&["a", "a1"]),
+            endpoint(&["b", "b1"]),
+            endpoint(&["b", "b2"]),
+            endpoint(&["c", "c1"]),
         ]);
-        policy
-            .resolver_update(update, &cfg, &mut controller)
+        t.update(update, &[("a", 30, Mock::Ready), ("b", 70, Mock::Ready)])
             .unwrap();
 
-        let latest = controller.states.last().expect("state update");
-        assert_eq!(latest.connectivity_state, ConnectivityState::Ready);
+        // Each child gets only the endpoints under its name, with that path
+        // element removed. "c" is not a target, so its endpoint goes nowhere.
+        let picker = t.take_state().picker;
+        let a = assert_picks(&*picker, "a");
+        assert_eq!(a.endpoints, Ok(vec![endpoint(&["a1"])]));
+        assert_eq!(a.attributes.get::<Locality>(), Some(&Locality("a".into())));
+        let b = assert_picks(&*picker, "b");
+        assert_eq!(b.endpoints, Ok(vec![endpoint(&["b1"]), endpoint(&["b2"])]));
+        assert_eq!(b.attributes.get::<Locality>(), Some(&Locality("b".into())));
+    }
 
-        let child_a = pick(&*latest.picker);
-        assert_eq!(child_a.tag, "child_a");
-        assert_eq!(child_a.locality.as_deref(), Some("locality_a"));
-        assert_eq!(child_a.endpoints.len(), 1);
-        assert_eq!(
-            &*child_a.endpoints[0].addresses[0].address,
-            "127.0.0.1:9001"
-        );
+    #[test]
+    fn resolver_update_forwards_errors_and_note_to_children() {
+        let mut t = Harness::new(&[0, 30]);
+        let mut update = ResolverUpdate::default();
+        update.endpoints = Err("endpoints error".to_string());
+        update.service_config = Err("service config error".to_string());
+        update.resolution_note = Some("note".to_string());
+        t.update(update, &[("a", 30, Mock::Ready), ("b", 70, Mock::Ready)])
+            .unwrap();
 
-        let child_b = pick(&*latest.picker);
-        assert_eq!(child_b.tag, "child_b");
-        assert_eq!(child_b.locality.as_deref(), Some("locality_b"));
-        assert_eq!(child_b.endpoints.len(), 1);
-        assert_eq!(
-            &*child_b.endpoints[0].addresses[0].address,
-            "127.0.0.1:9002"
-        );
+        let picker = t.take_state().picker;
+        for locality in ["a", "b"] {
+            let update = assert_picks(&*picker, locality);
+            assert_eq!(update.endpoints, Err("endpoints error".to_string()));
+            assert_eq!(update.service_config.unwrap_err(), "service config error");
+            assert_eq!(update.resolution_note.as_deref(), Some("note"));
+        }
     }
 
     #[test]
     fn child_error_still_publishes_picker() {
-        let (mut policy, _scheduler, mut controller) = setup_test_policy(vec![0]);
-
-        let config_json = serde_json::json!({
-            "targets": {
-                "locality_a": {
-                    "weight": 30,
-                    "childPolicy": [{
-                        MOCK_CHILD_POLICY_NAME: {
-                            "tag": "child_a",
-                            "initial_state": "ready"
-                        }
-                    }]
-                },
-                "locality_b": {
-                    "weight": 70,
-                    "childPolicy": [{
-                        MOCK_CHILD_POLICY_NAME: {
-                            "tag": "child_b",
-                            "initial_state": "ready",
-                            "fail_update": true
-                        }
-                    }]
-                }
-            }
-        });
-        let cfg = WeightedTargetBuilder::default()
-            .parse_config(&LbConfigJson::new(&config_json.to_string()).unwrap())
-            .unwrap();
-
-        let err = policy
-            .resolver_update(ResolverUpdate::default(), &cfg, &mut controller)
+        let mut t = Harness::new(&[0]);
+        let err = t
+            .update(
+                ResolverUpdate::default(),
+                &[("a", 30, Mock::Ready), ("b", 70, Mock::FailUpdate)],
+            )
             .unwrap_err();
         assert_eq!(
             err,
-            "weighted_target_experimental: failed to update children: child_b failed"
+            "weighted_target_experimental: failed to update children: mock failure"
         );
 
-        let latest = controller.states.last().expect("state update");
-        assert_eq!(latest.connectivity_state, ConnectivityState::Ready);
-        assert_picks_tag(&*latest.picker, "child_a");
+        let state = t.take_state();
+        assert_eq!(state.connectivity_state, ConnectivityState::Ready);
+        assert_picks(&*state.picker, "a");
     }
 
     #[test]
-    fn removed_target_is_shut_down() {
-        let (mut policy, _scheduler, mut controller) = setup_test_policy(vec![15, 45, 0]);
+    fn config_update_republishes_picker() {
+        // Key 30 selects "b" under weights 30/70 and "a" under 80/20.
+        let mut t = Harness::new(&[30, 30, 0]);
+        let state = t.apply(&[("a", 30, Mock::Ready), ("b", 70, Mock::Ready)]);
+        assert_picks(&*state.picker, "b");
 
-        let state = apply_json_config(
-            &mut policy,
-            &mut controller,
-            serde_json::json!({
-                "targets": {
-                    "locality_a": {
-                        "weight": 30,
-                        "childPolicy": [{
-                            MOCK_CHILD_POLICY_NAME: {
-                                "tag": "child_a",
-                                "initial_state": "ready"
-                            }
-                        }]
-                    },
-                    "locality_b": {
-                        "weight": 70,
-                        "childPolicy": [{
-                            MOCK_CHILD_POLICY_NAME: {
-                                "tag": "child_b",
-                                "initial_state": "ready"
-                            }
-                        }]
-                    }
-                }
-            }),
-        );
-        assert_eq!(state.connectivity_state, ConnectivityState::Ready);
-        assert_picks_tag(&*state.picker, "child_a");
-        assert_picks_tag(&*state.picker, "child_b");
+        // The children's states are unchanged in the next two updates, so
+        // only the new weights and the removal of "a" change the picker.
+        let state = t.apply(&[("a", 80, Mock::Ready), ("b", 20, Mock::Ready)]);
+        assert_picks(&*state.picker, "a");
 
-        // Drop locality_b from the config.
-        let state = apply_json_config(
-            &mut policy,
-            &mut controller,
-            serde_json::json!({
-                "targets": {
-                    "locality_a": {
-                        "weight": 30,
-                        "childPolicy": [{
-                            MOCK_CHILD_POLICY_NAME: {
-                                "tag": "child_a",
-                                "initial_state": "ready"
-                            }
-                        }]
-                    }
-                }
-            }),
-        );
-        assert_eq!(state.connectivity_state, ConnectivityState::Ready);
-        assert_picks_tag(&*state.picker, "child_a");
+        let state = t.apply(&[("b", 20, Mock::Ready)]);
+        assert_picks(&*state.picker, "b");
     }
 
     #[test]
-    fn state_aggregation_and_picker_selection() {
-        let (mut policy, _scheduler, mut controller) = setup_test_policy(vec![0, 10, 80]);
-
-        // 1 Ready + 1 Connecting -> overall Ready, only Ready child is picked.
-        let state = apply_json_config(
-            &mut policy,
-            &mut controller,
-            serde_json::json!({
-                "targets": {
-                    "locality_a": {
-                        "weight": 30,
-                        "childPolicy": [{
-                            MOCK_CHILD_POLICY_NAME: {
-                                "tag": "child_a",
-                                "initial_state": "ready"
-                            }
-                        }]
-                    },
-                    "locality_b": {
-                        "weight": 70,
-                        "childPolicy": [{
-                            MOCK_CHILD_POLICY_NAME: {
-                                "tag": "child_b",
-                                "initial_state": "connecting"
-                            }
-                        }]
-                    }
-                }
-            }),
-        );
+    fn ready_picker_excludes_non_ready_children() {
+        // Key 0 would select "a" if non-Ready children were included.
+        let mut t = Harness::new(&[0]);
+        let state = t.apply(&[
+            ("a", 10, Mock::Connecting),
+            ("b", 20, Mock::TransientFailure),
+            ("c", 70, Mock::Ready),
+        ]);
         assert_eq!(state.connectivity_state, ConnectivityState::Ready);
-        assert_picks_tag(&*state.picker, "child_a");
+        assert_picks(&*state.picker, "c");
+    }
 
-        // 1 Connecting + 1 TransientFailure -> overall Connecting (QueuingPicker).
-        let state = apply_json_config(
-            &mut policy,
-            &mut controller,
-            serde_json::json!({
-                "targets": {
-                    "locality_a": {
-                        "weight": 30,
-                        "childPolicy": [{
-                            MOCK_CHILD_POLICY_NAME: {
-                                "tag": "child_a",
-                                "initial_state": "transient_failure"
-                            }
-                        }]
-                    },
-                    "locality_b": {
-                        "weight": 70,
-                        "childPolicy": [{
-                            MOCK_CHILD_POLICY_NAME: {
-                                "tag": "child_b",
-                                "initial_state": "connecting"
-                            }
-                        }]
-                    }
-                }
-            }),
-        );
-        assert_eq!(state.connectivity_state, ConnectivityState::Connecting);
-        let headers = RequestHeaders::new();
-        let mut attrs = CallAttributes::new();
-        assert!(matches!(
-            state.picker.pick(PickOptions::new(&headers, &mut attrs)),
-            PickResult::Queue
-        ));
-        assert!(attrs.get::<PickedChild>().is_none());
-
-        // Both TransientFailure on resolver error -> overall TransientFailure, weighted across TF children.
-        let cfg = WeightedTargetBuilder::default()
-            .parse_config(
-                &LbConfigJson::new(
-                    &serde_json::json!({
-                        "targets": {
-                            "locality_a": {
-                                "weight": 30,
-                                "childPolicy": [{
-                                    MOCK_CHILD_POLICY_NAME: {
-                                        "tag": "child_a",
-                                        "initial_state": "transient_failure"
-                                    }
-                                }]
-                            },
-                            "locality_b": {
-                                "weight": 70,
-                                "childPolicy": [{
-                                    MOCK_CHILD_POLICY_NAME: {
-                                        "tag": "child_b",
-                                        "initial_state": "transient_failure"
-                                    }
-                                }]
-                            }
-                        }
-                    })
-                    .to_string(),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let mut err_update = ResolverUpdate::default();
-        err_update.endpoints = Err("resolver error".to_string());
-        policy
-            .resolver_update(err_update, &cfg, &mut controller)
-            .unwrap();
-
-        let latest = controller.states.last().expect("state update");
+    #[test]
+    fn transient_failure_picker_spans_failing_children() {
+        let mut t = Harness::new(&[0, 30]);
+        let state = t.apply(&[
+            ("a", 30, Mock::TransientFailure),
+            ("b", 70, Mock::TransientFailure),
+        ]);
         assert_eq!(
-            latest.connectivity_state,
+            state.connectivity_state,
             ConnectivityState::TransientFailure
         );
-        assert_picks_tag(&*latest.picker, "child_a");
-        assert_picks_tag(&*latest.picker, "child_b");
+        assert_picks(&*state.picker, "a");
+        assert_picks(&*state.picker, "b");
     }
 
     #[test]
-    fn work_and_exit_idle_delegate_to_children_and_refresh_picker() {
-        let (mut policy, scheduler, mut controller) = setup_test_policy(vec![0]);
-
-        let initial = apply_json_config(
-            &mut policy,
-            &mut controller,
-            serde_json::json!({
-                "targets": {
-                    "locality_a": {
-                        "weight": 100,
-                        "childPolicy": [{
-                            MOCK_CHILD_POLICY_NAME: {
-                                "tag": "child_a",
-                                "initial_state": "idle"
-                            }
-                        }]
-                    }
-                }
-            }),
-        );
-        assert_eq!(initial.connectivity_state, ConnectivityState::Idle);
-
-        policy.exit_idle(&mut controller);
-        let scheduled_work: Vec<_> = scheduler.items.lock().unwrap().drain(..).collect();
-        for item in scheduled_work {
-            policy.work(item, &mut controller);
+    fn connecting_and_idle_queue_without_reaching_children() {
+        // No keys: a weighted pick would panic in the sampler.
+        let mut t = Harness::new(&[]);
+        for (behavior, want) in [
+            (Mock::Connecting, ConnectivityState::Connecting),
+            (Mock::Idle, ConnectivityState::Idle),
+        ] {
+            let state = t.apply(&[("a", 30, Mock::TransientFailure), ("b", 70, behavior)]);
+            assert_eq!(state.connectivity_state, want);
+            assert!(pick(&*state.picker).is_none());
         }
-
-        let latest = controller.states.last().expect("state update");
-        assert_eq!(latest.connectivity_state, ConnectivityState::Ready);
-        assert_picks_tag(&*latest.picker, "child_a");
     }
 
     #[test]
-    fn work_and_exit_idle_without_child_update_publish_nothing() {
-        let (mut policy, scheduler, mut controller) = setup_test_policy(vec![]);
-        apply_json_config(
-            &mut policy,
-            &mut controller,
-            serde_json::json!({
-                "targets": {
-                    "locality_a": {
-                        "weight": 100,
-                        "childPolicy": [{
-                            MOCK_CHILD_POLICY_NAME: {
-                                "tag": "child_a",
-                                "initial_state": "ready"
-                            }
-                        }]
-                    }
-                }
-            }),
+    fn exit_idle_and_work_republish_only_on_child_update() {
+        let mut t = Harness::new(&[]);
+        t.apply(&[("a", 100, Mock::Ready)]);
+        t.policy.exit_idle(&mut t.controller);
+        t.run_work();
+        assert!(
+            t.controller.states.is_empty(),
+            "policy should not publish when no child updated"
         );
 
-        policy.exit_idle(&mut controller);
-        let scheduled_work: Vec<_> = scheduler.items.lock().unwrap().drain(..).collect();
-        assert!(!scheduled_work.is_empty());
-        for item in scheduled_work {
-            policy.work(item, &mut controller);
-        }
-
-        assert_eq!(controller.states.len(), 1);
+        t.apply(&[("a", 100, Mock::Idle)]);
+        t.policy.exit_idle(&mut t.controller);
+        assert_eq!(
+            t.take_state().connectivity_state,
+            ConnectivityState::Connecting
+        );
+        t.run_work();
+        assert_eq!(t.take_state().connectivity_state, ConnectivityState::Ready);
     }
 
-    fn setup_test_policy(
-        sample_sequence: Vec<u64>,
-    ) -> (
-        WeightedTargetPolicy,
-        Arc<RecordingWorkScheduler>,
-        RecordingChannelController,
-    ) {
-        GLOBAL_LB_REGISTRY.add_builder(MockChildBuilder);
-
-        let sampler = Arc::new(MockSampler::new(sample_sequence));
-        let builder = WeightedTargetBuilder::with_sampler(sampler);
-        let scheduler = Arc::new(RecordingWorkScheduler::default());
-        let policy = builder.build(LbPolicyOptions {
-            work_scheduler: scheduler.clone(),
-            runtime: grpc::__unstable::rt::default_runtime(),
-        });
-        let controller = RecordingChannelController::default();
-        (policy, scheduler, controller)
+    /// A `WeightedTargetPolicy` whose sampler returns the given keys in order.
+    struct Harness {
+        policy: WeightedTargetPolicy,
+        controller: RecordingChannelController,
+        scheduler: Arc<RecordingWorkScheduler>,
     }
 
-    fn apply_json_config(
-        policy: &mut WeightedTargetPolicy,
-        controller: &mut RecordingChannelController,
-        json: serde_json::Value,
-    ) -> LbState {
-        let cfg = WeightedTargetBuilder::default()
-            .parse_config(&LbConfigJson::new(&json.to_string()).unwrap())
-            .unwrap();
-        policy
-            .resolver_update(ResolverUpdate::default(), &cfg, controller)
-            .unwrap();
-        controller.states.last().expect("state update").clone()
-    }
-
-    fn assert_picks_tag(picker: &dyn Picker, expected: &str) {
-        assert_eq!(pick(picker).tag, expected);
-    }
-
-    fn pick(picker: &dyn Picker) -> PickedChild {
-        let headers = RequestHeaders::new();
-        let mut attrs = CallAttributes::new();
-        assert!(matches!(
-            picker.pick(PickOptions::new(&headers, &mut attrs)),
-            PickResult::Queue
-        ));
-        attrs
-            .get::<PickedChild>()
-            .expect("picked child attribute")
-            .clone()
-    }
-
-    #[derive(Debug)]
-    struct MockSampler {
-        sequences: Mutex<Vec<u64>>,
-    }
-
-    impl MockSampler {
-        fn new(seq: Vec<u64>) -> Self {
+    impl Harness {
+        fn new(keys: &[u64]) -> Self {
+            GLOBAL_LB_REGISTRY.add_builder(MockChildBuilder);
+            let scheduler = Arc::new(RecordingWorkScheduler::default());
+            let sampler = sampler(keys);
+            let policy = WeightedTargetBuilder::with_sampler(sampler).build(LbPolicyOptions {
+                work_scheduler: scheduler.clone(),
+                runtime: grpc::__unstable::rt::default_runtime(),
+            });
             Self {
-                sequences: Mutex::new(seq),
+                policy,
+                controller: RecordingChannelController::default(),
+                scheduler,
             }
         }
-    }
 
-    impl RngSampler for MockSampler {
-        fn sample(&self, _total_weight: u64) -> u64 {
-            let mut seq = self.sequences.lock().unwrap();
-            if seq.is_empty() { 0 } else { seq.remove(0) }
+        /// Sends `update` with one mock child per `(name, weight, behavior)`.
+        /// Each child is tagged with its target name.
+        fn update(
+            &mut self,
+            update: ResolverUpdate,
+            targets: &[(&str, u32, Mock)],
+        ) -> Result<(), String> {
+            let targets: serde_json::Map<_, _> = targets
+                .iter()
+                .map(|&(name, weight, behavior)| {
+                    let child_config = json!({ "tag": name, "behavior": behavior });
+                    let child_policy = json!([{ MOCK_CHILD_POLICY_NAME: child_config }]);
+                    let target = json!({ "weight": weight, "childPolicy": child_policy });
+                    (name.to_string(), target)
+                })
+                .collect();
+            let json = json!({ "targets": targets }).to_string();
+            let config = WeightedTargetBuilder::default()
+                .parse_config(&LbConfigJson::new(&json).unwrap())
+                .expect("test config should parse");
+            self.policy
+                .resolver_update(update, &config, &mut self.controller)
+        }
+
+        /// Sends `targets` with an empty resolver update and returns the
+        /// published state.
+        fn apply(&mut self, targets: &[(&str, u32, Mock)]) -> LbState {
+            self.update(ResolverUpdate::default(), targets)
+                .expect("resolver update should succeed");
+            self.take_state()
+        }
+
+        /// Returns the one state published since the last call.
+        fn take_state(&mut self) -> LbState {
+            let mut states = std::mem::take(&mut self.controller.states);
+            assert_eq!(states.len(), 1, "policy should publish exactly one state");
+            states.pop().unwrap()
+        }
+
+        fn run_work(&mut self) {
+            let work = self.scheduler.0.lock().unwrap().pop();
+            let work = work.expect("a child should have scheduled work");
+            self.policy.work(work, &mut self.controller);
         }
     }
 
-    const MOCK_CHILD_POLICY_NAME: &str = "test_weighted_target_mock_child";
-
-    #[derive(Clone, Debug, Deserialize)]
-    struct MockChildConfig {
-        tag: String,
-        initial_state: String,
-        #[serde(default)]
-        fail_update: bool,
+    /// Picks once and returns what the child that handled the pick reported,
+    /// or `None` if the pick was queued without reaching a child.
+    fn pick(picker: &dyn Picker) -> Option<PickedChild> {
+        let headers = RequestHeaders::new();
+        let mut attrs = CallAttributes::new();
+        let result = picker.pick(PickOptions::new(&headers, &mut attrs));
+        assert!(
+            matches!(result, PickResult::Queue),
+            "pick should queue, got {result:?}"
+        );
+        attrs.get::<PickedChild>().cloned()
     }
 
-    /// What a mock child received in its last resolver update. Its picker
-    /// writes this into the call attributes.
-    #[derive(Clone, Debug, Default)]
+    /// Asserts that a pick reaches the child tagged `tag`, and returns the
+    /// resolver update that child received.
+    fn assert_picks(picker: &dyn Picker, tag: &str) -> ResolverUpdate {
+        let picked = pick(picker).expect("pick should reach a child");
+        assert_eq!(picked.tag, tag);
+        picked.update
+    }
+
+    fn endpoint(path: &[&str]) -> Endpoint {
+        set_path_in_endpoint(
+            Endpoint::default(),
+            path.iter().map(|p| p.to_string()).collect(),
+        )
+    }
+
+    fn sampler(keys: &[u64]) -> Arc<MockSampler> {
+        Arc::new(MockSampler(Mutex::new(keys.to_vec().into())))
+    }
+
+    /// Returns the given keys in order. Panics when the keys run out or a key
+    /// is not below the total weight, so no pick depends on an unplanned key.
+    #[derive(Debug)]
+    struct MockSampler(Mutex<VecDeque<u64>>);
+
+    impl RngSampler for MockSampler {
+        fn sample(&self, total_weight: u64) -> u64 {
+            let key = self.0.lock().unwrap().pop_front();
+            let key = key.expect("test should provide a key for every weighted pick");
+            assert!(
+                key < total_weight,
+                "key {key} should be below total weight {total_weight}"
+            );
+            key
+        }
+    }
+
+    /// What a mock child's picker adds to the call attributes.
+    #[derive(Clone, Debug)]
     struct PickedChild {
         tag: String,
-        locality: Option<Arc<str>>,
-        endpoints: Vec<Endpoint>,
+        /// The last resolver update the child received.
+        update: ResolverUpdate,
     }
 
     #[derive(Debug)]
-    struct TaggedPicker(PickedChild);
+    struct MockPicker(PickedChild);
 
-    impl Picker for TaggedPicker {
+    impl Picker for MockPicker {
         fn pick(&self, options: PickOptions<'_>) -> PickResult {
             options.call_attributes.add(self.0.clone());
             PickResult::Queue
         }
     }
 
-    fn tagged_picker(tag: &str) -> Arc<dyn Picker> {
-        Arc::new(TaggedPicker(PickedChild {
+    fn mock_picker(tag: &str) -> Arc<dyn Picker> {
+        Arc::new(MockPicker(PickedChild {
             tag: tag.to_string(),
-            ..Default::default()
+            update: ResolverUpdate::default(),
         }))
     }
 
-    #[derive(Clone, Debug)]
+    const MOCK_CHILD_POLICY_NAME: &str = "test_weighted_target_mock_child";
+
+    /// How the mock child responds to a resolver update.
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Mock {
+        Idle,
+        Connecting,
+        Ready,
+        TransientFailure,
+        /// Returns an error without publishing a state.
+        FailUpdate,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct MockConfig {
+        tag: String,
+        behavior: Mock,
+    }
+
+    #[derive(Debug)]
     struct MockChildBuilder;
 
+    /// Publishes a `MockPicker` in every state, so a pick that reaches a
+    /// child is always observable.
     #[derive(Debug)]
     struct MockChildPolicy {
         work_scheduler: Arc<dyn WorkScheduler>,
-        state: ConnectivityState,
+        state: Option<ConnectivityState>,
         picked: PickedChild,
     }
 
     impl MockChildPolicy {
-        fn state_for(name: &str) -> ConnectivityState {
-            match name {
-                "ready" => ConnectivityState::Ready,
-                "transient_failure" => ConnectivityState::TransientFailure,
-                "idle" => ConnectivityState::Idle,
-                _ => ConnectivityState::Connecting,
+        /// Publishes only on a state change, so an update that leaves the state
+        /// unchanged is not reported to the parent as a child update.
+        fn set_state(&mut self, state: ConnectivityState, controller: &mut dyn ChannelController) {
+            if self.state != Some(state) {
+                self.state = Some(state);
+                controller.update_picker(LbState {
+                    connectivity_state: state,
+                    picker: Arc::new(MockPicker(self.picked.clone())),
+                });
             }
-        }
-
-        fn publish(&self, ctrl: &mut dyn ChannelController) {
-            let picker: Arc<dyn Picker> = match self.state {
-                ConnectivityState::Ready | ConnectivityState::TransientFailure => {
-                    Arc::new(TaggedPicker(self.picked.clone()))
-                }
-                ConnectivityState::Connecting | ConnectivityState::Idle => Arc::new(QueuingPicker),
-            };
-            ctrl.update_picker(LbState {
-                connectivity_state: self.state,
-                picker,
-            });
         }
     }
 
@@ -900,8 +729,11 @@ mod tests {
         fn build(&self, options: LbPolicyOptions) -> Self::LbPolicy {
             MockChildPolicy {
                 work_scheduler: options.work_scheduler,
-                state: ConnectivityState::Connecting,
-                picked: PickedChild::default(),
+                state: None,
+                picked: PickedChild {
+                    tag: String::new(),
+                    update: ResolverUpdate::default(),
+                },
             }
         }
 
@@ -909,58 +741,61 @@ mod tests {
             MOCK_CHILD_POLICY_NAME
         }
 
-        fn parse_config(&self, config: &LbConfigJson) -> Result<MockChildConfig, String> {
+        fn parse_config(&self, config: &LbConfigJson) -> Result<MockConfig, String> {
             config.convert_to().map_err(|e| e.to_string())
         }
     }
 
     impl LbPolicy for MockChildPolicy {
-        type LbConfig = MockChildConfig;
+        type LbConfig = MockConfig;
 
         fn resolver_update(
             &mut self,
             update: ResolverUpdate,
-            config: &Self::LbConfig,
+            config: &MockConfig,
             channel_controller: &mut dyn ChannelController,
         ) -> Result<(), String> {
             self.picked = PickedChild {
                 tag: config.tag.clone(),
-                locality: update.attributes.get::<Locality>().map(|l| l.0.clone()),
-                endpoints: update.endpoints.unwrap_or_default(),
+                update,
             };
-            if config.fail_update {
-                return Err(format!("{} failed", config.tag));
-            }
-            self.state = Self::state_for(&config.initial_state);
-            self.publish(channel_controller);
+            let state = match config.behavior {
+                Mock::Idle => ConnectivityState::Idle,
+                Mock::Connecting => ConnectivityState::Connecting,
+                Mock::Ready => ConnectivityState::Ready,
+                Mock::TransientFailure => ConnectivityState::TransientFailure,
+                Mock::FailUpdate => return Err("mock failure".to_string()),
+            };
+            self.set_state(state, channel_controller);
             Ok(())
         }
 
-        // An Idle child becomes Ready on the work scheduled by `exit_idle`.
+        // Idle -> Connecting on `exit_idle`, then Connecting -> Ready on the
+        // work that `exit_idle` schedules.
+        fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
+            self.work_scheduler.schedule_work(None);
+            if self.state == Some(ConnectivityState::Idle) {
+                self.set_state(ConnectivityState::Connecting, channel_controller);
+            }
+        }
+
         fn work(
             &mut self,
             _data: Option<WorkData>,
             channel_controller: &mut dyn ChannelController,
         ) {
-            if self.state == ConnectivityState::Idle {
-                self.state = ConnectivityState::Ready;
-                self.publish(channel_controller);
+            if self.state == Some(ConnectivityState::Connecting) {
+                self.set_state(ConnectivityState::Ready, channel_controller);
             }
-        }
-
-        fn exit_idle(&mut self, _channel_controller: &mut dyn ChannelController) {
-            self.work_scheduler.schedule_work(None);
         }
     }
 
     #[derive(Debug, Default)]
-    struct RecordingWorkScheduler {
-        items: Mutex<Vec<Option<WorkData>>>,
-    }
+    struct RecordingWorkScheduler(Mutex<Vec<Option<WorkData>>>);
 
     impl WorkScheduler for RecordingWorkScheduler {
         fn schedule_work(&self, data: Option<WorkData>) {
-            self.items.lock().unwrap().push(data);
+            self.0.lock().unwrap().push(data);
         }
     }
 
@@ -974,10 +809,7 @@ mod tests {
             &mut self,
             _address: &Address,
             _work_scheduler: Arc<dyn WorkScheduler>,
-        ) -> (
-            Arc<dyn grpc::__unstable::client::load_balancing::subchannel::Subchannel>,
-            grpc::__unstable::client::load_balancing::subchannel::SubchannelState,
-        ) {
+        ) -> (Arc<dyn Subchannel>, SubchannelState) {
             unimplemented!()
         }
 
@@ -985,15 +817,8 @@ mod tests {
             self.states.push(update);
         }
 
-        fn request_resolution(&mut self) {}
-    }
-
-    fn make_endpoint(addr_str: &str, locality_path: &str) -> Endpoint {
-        let mut addr = Address::default();
-        addr.network_type = "tcp";
-        addr.address = addr_str.to_string().into();
-        let mut ep = Endpoint::default();
-        ep.addresses = vec![addr];
-        set_path_in_endpoint(ep, vec![locality_path.to_string()])
+        fn request_resolution(&mut self) {
+            unimplemented!()
+        }
     }
 }
