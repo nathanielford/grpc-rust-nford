@@ -247,3 +247,47 @@ async fn shutdown_closes_listener_before_drain() {
     call.await.unwrap().unwrap();
     jh.await.unwrap();
 }
+
+#[tokio::test]
+async fn mock_duplex_works_with_incoming_shutdown() {
+    use hyper_util::rt::TokioIo;
+    use tonic::transport::Uri;
+    use tower::service_fn;
+
+    let (client, server) = tokio::io::duplex(1024);
+    let (tx, rx) = oneshot::channel();
+    let sender = Arc::new(Mutex::new(Some(tx)));
+    let svc = test_server::TestServer::new(Svc(sender));
+
+    let jh = tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(tokio_stream::once(Ok::<_, io::Error>(server)), async {
+                drop(rx.await)
+            })
+            .await
+            .unwrap();
+    });
+
+    let mut client = Some(client);
+    let channel = Endpoint::try_from("http://[::]:50051")
+        .unwrap()
+        .connect_with_connector(service_fn(move |_: Uri| {
+            let client = client.take();
+
+            async move {
+                if let Some(client) = client {
+                    Ok(TokioIo::new(client))
+                } else {
+                    Err(io::Error::other("Client already taken"))
+                }
+            }
+        }))
+        .await
+        .unwrap();
+
+    let mut client = TestClient::new(channel);
+    client.unary_call(Request::new(Input {})).await.unwrap();
+
+    jh.await.unwrap();
+}

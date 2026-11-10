@@ -882,6 +882,9 @@ impl<L> Server<L> {
                                 continue;
                             },
                             None => {
+                                if graceful {
+                                    let _ = (&mut sig).await;
+                                }
                                 break
                             },
                         };
