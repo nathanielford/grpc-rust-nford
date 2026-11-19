@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -52,6 +53,7 @@ use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::load_balancing::subchannel::SubchannelUpdate;
 use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::ResolverUpdate;
+use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
 use crate::core::Address;
 use crate::metadata::MetadataMap;
 use crate::rt::BoxedTaskHandle;
@@ -157,6 +159,33 @@ impl Debug for PickFirstPolicy {
             .field("resolution_note", &self.resolution_note)
             .field("pending_addresses", &self.pending_addresses)
             .finish()
+    }
+}
+
+/// An address family, for interleaving addresses as per RFC 8305 section 4
+/// (gRFC A61).
+#[derive(PartialEq)]
+enum AddressFamily {
+    Ipv4,
+    Ipv6,
+    /// Not an IP address and port, e.g. a hostname or a Unix socket path.
+    // Neither gRFC A61 nor RFC 8305 specifies how to handle non-IP addresses;
+    // grouping them into a third family that participates in interleaving is
+    // intentional and matches Go.
+    Unknown,
+}
+
+impl From<&Address> for AddressFamily {
+    fn from(addr: &Address) -> Self {
+        if addr.network_type != TCP_IP_NETWORK_TYPE {
+            return Self::Unknown;
+        }
+        // An IPv4-mapped IPv6 address counts as IPv4, as in Go and Java.
+        match addr.address.parse::<SocketAddr>() {
+            Ok(sa) if sa.ip().to_canonical().is_ipv4() => Self::Ipv4,
+            Ok(_) => Self::Ipv6,
+            Err(_) => Self::Unknown,
+        }
     }
 }
 
@@ -476,42 +505,30 @@ impl PickFirstPolicy {
             .filter(|addr| seen.insert(addr.clone()))
             .collect();
 
-        // Partition out all 'unknown' non-TCP addresses.
-        // This is to remain consistent with similar behavior in C++ and Java.
-        let (tcp_addresses, unknown): (Vec<Address>, Vec<Address>) =
-            unique_addresses.into_iter().partition(|addr| {
-                addr.network_type == crate::client::name_resolution::TCP_IP_NETWORK_TYPE
-            });
+        // Group the addresses by address family. Families are kept in order of
+        // first appearance.
+        let mut families: Vec<(AddressFamily, Vec<Address>)> = Vec::new();
+        for addr in unique_addresses {
+            let family = AddressFamily::from(&addr);
+            match families.iter_mut().find(|(f, _)| *f == family) {
+                Some((_, addrs)) => addrs.push(addr),
+                None => families.push((family, vec![addr])),
+            }
+        }
 
-        // Partition by family (Basic IPv6 detection via colon).
-        let (ipv6, ipv4): (Vec<Address>, Vec<Address>) = tcp_addresses
+        // Interleave the families as per RFC 8305 section 4: take one address
+        // from each family in turn, starting with the family of the first
+        // address.
+        let mut families: Vec<_> = families
             .into_iter()
-            .partition(|addr| addr.address.contains(':'));
-
-        // Interleave the two lists so ipv6 and ipv4 addresses are alternated.
-        let mut interleaved = Vec::with_capacity(ipv6.len() + ipv4.len() + unknown.len());
-        let mut v6_iter = ipv6.into_iter();
-        let mut v4_iter = ipv4.into_iter();
-        let mut unknown_iter = unknown.into_iter();
-
-        loop {
-            let mut more = false;
-
-            if let Some(v6) = v6_iter.next() {
-                interleaved.push(v6);
-                more = true;
-            }
-            if let Some(v4) = v4_iter.next() {
-                interleaved.push(v4);
-                more = true;
-            }
-            if let Some(unknown) = unknown_iter.next() {
-                interleaved.push(unknown);
-                more = true;
-            }
-
-            if !more {
-                break;
+            .map(|(_, addrs)| addrs.into_iter())
+            .collect();
+        let mut interleaved = Vec::with_capacity(seen.len());
+        while interleaved.len() < seen.len() {
+            for addrs in &mut families {
+                if let Some(addr) = addrs.next() {
+                    interleaved.push(addr);
+                }
             }
         }
         interleaved
@@ -1205,9 +1222,9 @@ mod test {
         // EP2: [V6_2]
         // EP3: [V4_2]
         let endpoints = vec![
-            endpoint(&["::1", "127.0.0.1"]),
-            endpoint(&["::2"]),
-            endpoint(&["127.0.0.2"]),
+            endpoint(&["[::1]:80", "127.0.0.1:80"]),
+            endpoint(&["[::2]:80"]),
+            endpoint(&["127.0.0.2:80"]),
         ];
 
         env.send_resolver_update_with_config(endpoints, &config)
@@ -1222,11 +1239,115 @@ mod test {
         // IPv6: [::2, ::1]
         // IPv4: [127.0.0.2, 127.0.0.1]
         //
-        // Interleaved: [::2, 127.0.0.2, ::1, 127.0.0.1]
-        env.expect_new_subchannels(&["::2", "127.0.0.2", "::1", "127.0.0.1"]);
-        env.expect_connect_to("::2");
+        // Interleaved, starting with the family of the first address (IPv4):
+        // [127.0.0.2, ::2, 127.0.0.1, ::1]
+        env.expect_new_subchannels(&["127.0.0.2:80", "[::2]:80", "127.0.0.1:80", "[::1]:80"]);
+        env.expect_connect_to("127.0.0.2:80");
         env.expect_queuing_picker();
         env.expect_no_events();
+    }
+
+    // Sends one single-address endpoint per entry in `addrs`, as the DNS
+    // resolver does, and verifies that the policy creates subchannels and
+    // connects in `want` order.
+    fn check_address_order(addrs: &[&str], want: &[&str]) {
+        let mut env = new_env();
+        env.send_resolver_update(create_endpoints(addrs)).unwrap();
+        env.expect_new_subchannels(want);
+        env.expect_connect_to(want[0]);
+        env.expect_queuing_picker();
+        env.expect_no_events();
+    }
+
+    // Addresses are interleaved by family as per RFC 8305 section 4 (gRFC
+    // A61), starting with the family of the first address, here IPv4. An
+    // IPv4-mapped IPv6 address counts as IPv4. The zone ID is numeric, as
+    // Rust's SocketAddr parses only numeric zone IDs.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_interleaving_ipv4_preferred() {
+        check_address_order(
+            &[
+                "1.1.1.1:1111",
+                "2.2.2.2:2",
+                "3.3.3.3:3",
+                "[::FFFF:192.168.0.1]:2222",
+                "[0001:0001:0001:0001:0001:0001:0001:0001]:8080",
+                "[0002:0002:0002:0002:0002:0002:0002:0002]:8080",
+                "[fe80::1%2]:3333",
+                "grpc.io:80",
+            ],
+            &[
+                "1.1.1.1:1111",
+                "[0001:0001:0001:0001:0001:0001:0001:0001]:8080",
+                "grpc.io:80",
+                "2.2.2.2:2",
+                "[0002:0002:0002:0002:0002:0002:0002:0002]:8080",
+                "3.3.3.3:3",
+                "[fe80::1%2]:3333",
+                "[::FFFF:192.168.0.1]:2222",
+            ],
+        );
+    }
+
+    // Addresses are interleaved by family, starting with the family of the
+    // first address, here IPv6 (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_interleaving_ipv6_preferred() {
+        check_address_order(
+            &[
+                "[0001:0001:0001:0001:0001:0001:0001:0001]:8080",
+                // A duplicate, which is dropped.
+                "[0001:0001:0001:0001:0001:0001:0001:0001]:8080",
+                "1.1.1.1:1111",
+                "2.2.2.2:2",
+                "3.3.3.3:3",
+                "[::FFFF:192.168.0.1]:2222",
+                "[0002:0002:0002:0002:0002:0002:0002:0002]:2222",
+                "[fe80::1%2]:3333",
+                "grpc.io:80",
+            ],
+            &[
+                "[0001:0001:0001:0001:0001:0001:0001:0001]:8080",
+                "1.1.1.1:1111",
+                "grpc.io:80",
+                "[0002:0002:0002:0002:0002:0002:0002:0002]:2222",
+                "2.2.2.2:2",
+                "[fe80::1%2]:3333",
+                "3.3.3.3:3",
+                "[::FFFF:192.168.0.1]:2222",
+            ],
+        );
+    }
+
+    // Addresses that are not an IP address and port, such as hostnames, form
+    // a third family for interleaving, here the family of the first address
+    // (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_interleaving_unknown_preferred() {
+        check_address_order(
+            &[
+                "grpc.io:80",
+                "1.1.1.1:1111",
+                "2.2.2.2:2",
+                "3.3.3.3:3",
+                "[::FFFF:192.168.0.1]:2222",
+                "[0001:0001:0001:0001:0001:0001:0001:0001]:8080",
+                "[0002:0002:0002:0002:0002:0002:0002:0002]:8080",
+                "[fe80::1%2]:3333",
+                "example.com:80",
+            ],
+            &[
+                "grpc.io:80",
+                "1.1.1.1:1111",
+                "[0001:0001:0001:0001:0001:0001:0001:0001]:8080",
+                "example.com:80",
+                "2.2.2.2:2",
+                "[0002:0002:0002:0002:0002:0002:0002:0002]:8080",
+                "3.3.3.3:3",
+                "[fe80::1%2]:3333",
+                "[::FFFF:192.168.0.1]:2222",
+            ],
+        );
     }
 
     // De-duplicate addresses that appear multiple times within the same
