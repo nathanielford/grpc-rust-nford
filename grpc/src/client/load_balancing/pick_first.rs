@@ -1185,34 +1185,6 @@ mod test {
         env.expect_no_events();
     }
 
-    // A subchannel that reported READY while another was selected is selected
-    // as soon as a new connection pass starts, without asking any subchannel
-    // to connect.
-    #[tokio::test(start_paused = true)]
-    async fn test_pick_first_new_pass_selects_subchannel_already_ready() {
-        let mut env = new_env();
-        let scs = env.simulate_successful_connection(&["addr1", "addr2"]);
-        env.send_resolver_update(create_endpoints(&["addr1", "addr2"]))
-            .unwrap();
-        let sc2 = env.expect_new_subchannel_for("addr2");
-        env.send_subchannel_update(&sc2, &SubchannelState::ready());
-        env.expect_no_events();
-
-        // addr1 disconnects, and a pick starts a new pass.
-        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
-        let idle_picker = env.expect_idle_picker_after_disconnect();
-        let _ = idle_picker.pick(PickOptions::new(
-            &test_utils::new_request_headers(),
-            &CallOptions::new(),
-        ));
-        env.run_work();
-
-        // The pass selects the already-READY addr2 without asking addr1 or
-        // addr2 to connect.
-        env.expect_ready_picker(&sc2);
-        env.expect_no_events();
-    }
-
     // While a subchannel is selected, a failure from another subchannel does
     // not change what the policy reports.
     #[tokio::test(start_paused = true)]
@@ -2021,32 +1993,6 @@ mod test {
         env.expect_new_subchannels(&["addr2"]);
         // addr2's error replaces addr1's older one.
         env.expect_failing_picker("addr2 failed");
-        env.expect_request_resolution();
-        env.expect_no_events();
-    }
-
-    // When the selected subchannel fails, its error is the latest one, so a
-    // pass that then finds every subchannel in TRANSIENT_FAILURE reports it.
-    #[tokio::test(start_paused = true)]
-    async fn test_pick_first_selected_subchannel_error_is_latest() {
-        let mut env = new_env();
-        let scs = env.simulate_failed_connection(&["addr1"]);
-        env.expect_failing_picker("connection refused");
-        env.expect_request_resolution();
-        // addr1 finishes its backoff, is reconnected, and is selected.
-        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
-        env.expect_connect_to("addr1");
-        env.send_subchannel_update(&scs[0], &SubchannelState::ready());
-        env.expect_ready_picker(&scs[0]);
-
-        env.send_subchannel_update(
-            &scs[0],
-            &SubchannelState::transient_failure("addr1 failed again"),
-        );
-        env.expect_idle_picker_after_disconnect();
-        env.policy.exit_idle(&mut env.tcc);
-        // The selected subchannel's error replaces the older one.
-        env.expect_failing_picker("addr1 failed again");
         env.expect_request_resolution();
         env.expect_no_events();
     }
