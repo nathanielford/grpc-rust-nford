@@ -297,9 +297,13 @@ impl PickFirstPolicy {
         if let Some(attempting) = self.subchannels.get(self.frontier_index)
             && attempting.address() == subchannel.address()
             && state.connectivity_state == ConnectivityState::TransientFailure
-            && let Some(next_sc) = self.advance_frontier(false)
         {
-            self.trigger_subchannel_connection(next_sc, channel_controller);
+            // The current attempt failed: cancel its timer, even if no
+            // subchannel is left to attempt (gRFC A61).
+            self.timer = None;
+            if let Some(next_sc) = self.advance_frontier(false) {
+                self.trigger_subchannel_connection(next_sc, channel_controller);
+            }
         }
 
         // Check if First Pass is fully exhausted (frontier exhausted AND zero connecting).
@@ -386,6 +390,9 @@ impl PickFirstPolicy {
     /// Triggers a connection on the subchannel, and starts the 250ms timer.
     /// If no connection succeeds before the timer expires, the frontier will
     /// advance to the next subchannel.
+    ///
+    /// `sc` must be the subchannel at the frontier. No timer is started if it
+    /// is the last subchannel in the list (gRFC A61).
     fn trigger_subchannel_connection(
         &mut self,
         sc: Arc<dyn Subchannel>,
@@ -400,11 +407,11 @@ impl PickFirstPolicy {
         );
         sc.connect();
 
-        // Start happy eyeballs timer; replacing any pre-existing timer.
-        self.timer = Some(Timer::start(
-            self.runtime.clone(),
-            self.work_scheduler.clone(),
-        ));
+        // Start happy eyeballs timer unless sc is the last subchannel in the
+        // list, replacing any pre-existing timer.
+        let is_last = self.frontier_index + 1 >= self.subchannels.len();
+        self.timer =
+            (!is_last).then(|| Timer::start(self.runtime.clone(), self.work_scheduler.clone()));
     }
 
     // Converts the update endpoints to an address list.
@@ -777,6 +784,7 @@ mod test {
     use crate::client::load_balancing::test_utils;
     use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEnv;
+    use crate::client::load_balancing::test_utils::TestEvent;
     use crate::rt::default_runtime;
 
     // A ChannelController wrapper that delegates to TestChannelController,
@@ -882,6 +890,25 @@ mod test {
             subchannels
         }
 
+        // Consumes the NewSubchannel events produced so far, and returns the
+        // created subchannels by address, for checks that don't depend on which
+        // subchannels the policy creates, or when. Other events are kept, in
+        // order, for the caller to verify.
+        fn take_new_subchannels(&mut self) -> HashMap<String, Arc<dyn Subchannel>> {
+            let events: Vec<TestEvent> = self.rx_events.try_iter().collect();
+            let mut created = HashMap::new();
+            for event in events {
+                match event {
+                    TestEvent::NewSubchannel(sc) => {
+                        let prev = created.insert(sc.address().address.to_string(), sc);
+                        assert!(prev.is_none(), "two subchannels created for one address");
+                    }
+                    other => self.tcc.tx_events.send(other).unwrap(),
+                }
+            }
+            created
+        }
+
         // Advances virtual time by `duration` on the paused Tokio runtime,
         // yielding before and after so spawned timer tasks can register on the
         // timer wheel and schedule their completion work.
@@ -942,6 +969,24 @@ mod test {
             self.advance_past_timer().await;
             self.run_work();
         }
+
+        // Expects the IDLE picker the policy reports after its selected
+        // subchannel disconnects, and returns it. A re-resolution request may
+        // come before or after the picker; whether one comes is not checked.
+        fn expect_idle_picker_after_disconnect(&mut self) -> Arc<dyn Picker> {
+            let mut picker = None;
+            while let Ok(event) = self.rx_events.try_recv() {
+                match event {
+                    TestEvent::RequestResolution => {}
+                    TestEvent::UpdatePicker(update) if picker.is_none() => {
+                        assert_eq!(update.connectivity_state, ConnectivityState::Idle);
+                        picker = Some(update.picker);
+                    }
+                    other => panic!("unexpected event after disconnect: {other:?}"),
+                }
+            }
+            picker.expect("expected an IDLE picker after the disconnect")
+        }
     }
 
     // If the first address fails, the LB should failover to the second address.
@@ -971,9 +1016,9 @@ mod test {
         let endpoints_new = create_endpoints(&["addr2", "addr1", "addr3"]);
         env.send_resolver_update(endpoints_new).unwrap();
 
-        // Should create new subchannels for addr2 (was cleared by cleanup) and
-        // addr3 (was not in previous list).
-        env.expect_new_subchannels(&["addr2", "addr3"]);
+        // The selected subchannel is kept: no new one is created for addr1.
+        let created = env.take_new_subchannels();
+        assert!(!created.contains_key("addr1"));
 
         // Should NOT have any more events (no Connect, no UpdatePicker),
         // because it stuck to the original selected subchannel.
@@ -982,7 +1027,7 @@ mod test {
         // addr1 is still selected: only the selected subchannel going IDLE
         // moves the policy to IDLE.
         env.send_subchannel_update(&scs[0], &SubchannelState::idle());
-        env.expect_picker_state(ConnectivityState::Idle);
+        env.expect_idle_picker_after_disconnect();
         env.expect_no_events();
     }
 
@@ -1259,6 +1304,17 @@ mod test {
         env.expect_no_events();
     }
 
+    // With a single address, the only connection attempt is on the last
+    // subchannel, so no timer is started (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_no_timer_for_single_address() {
+        let mut env = new_env();
+        env.simulate_connection(&["addr1"]);
+
+        env.advance_past_timer().await;
+        env.expect_no_events();
+    }
+
     // If new_subchannel returns a subchannel that is already READY, the policy
     // selects it immediately, without asking any other subchannel to connect
     // (gRFC A61).
@@ -1271,8 +1327,8 @@ mod test {
         )
         .unwrap();
 
-        let scs = env.expect_new_subchannels(&["addr1", "addr2", "addr3"]);
-        env.expect_ready_picker(&scs[1]);
+        let scs = env.take_new_subchannels();
+        env.expect_ready_picker(&scs["addr2"]);
         env.expect_no_events();
     }
 
@@ -1443,6 +1499,33 @@ mod test {
             .await;
         env.run_work();
         env.expect_connect_to("addr3");
+        env.expect_no_events();
+    }
+
+    // When the current connection attempt fails and no subchannel is left to
+    // attempt, the pass cancels the Connection Attempt Delay timer and waits
+    // for the earlier attempts to finish (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_attempt_failure_with_nothing_left_cancels_timer() {
+        let mut env = new_env();
+        let scs = env.simulate_connection(&["addr1", "addr2", "addr3"]);
+
+        env.fire_timer().await;
+        env.expect_connect_to("addr2");
+
+        // addr3 fails before the pass reaches it, then addr2 fails while addr1
+        // is still connecting.
+        env.send_subchannel_update(&scs[2], &SubchannelState::transient_failure("addr3 failed"));
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 failed"));
+        env.expect_no_events();
+
+        env.advance_past_timer().await;
+        env.expect_no_events();
+
+        // addr1 fails, ending the pass.
+        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 failed"));
+        env.expect_failing_picker("addr1 failed");
+        env.expect_request_resolution();
         env.expect_no_events();
     }
 
