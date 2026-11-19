@@ -1723,6 +1723,33 @@ mod test {
         env.expect_no_events();
     }
 
+    // A pass that starts with every subchannel already in TRANSIENT_FAILURE
+    // ends at once, and reports the latest connection error.
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_pass_starting_in_transient_failure_reports_connection_error() {
+        let mut env = new_env();
+        let scs = env.simulate_failed_connection(&["addr1", "addr2"]);
+        env.expect_connect_to("addr2");
+        env.send_subchannel_update(&scs[1], &SubchannelState::transient_failure("addr2 failed"));
+        env.expect_failing_picker("addr2 failed");
+        env.expect_request_resolution();
+
+        // In steady state, addr1 fails again with a newer error.
+        env.send_subchannel_update(&scs[0], &SubchannelState::idle());
+        env.expect_connect_to("addr1");
+        env.send_subchannel_update(&scs[0], &SubchannelState::transient_failure("addr1 newest"));
+        env.expect_no_events();
+
+        // Both subchannels are reused and still in TRANSIENT_FAILURE, so the
+        // new pass has nothing to attempt. It reports the newest error, though
+        // addr2 is last in address order.
+        env.send_resolver_update(create_endpoints(&["addr1", "addr2"]))
+            .unwrap();
+        env.expect_failing_picker("addr1 newest");
+        env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
     // The first pass ends only when every address has failed during this pass.
     //
     // A later attempt failing while an earlier one is still in flight does not
