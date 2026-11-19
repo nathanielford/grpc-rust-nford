@@ -86,6 +86,7 @@ impl LbPolicyBuilder for PickFirstBuilder {
             subchannel_states: HashMap::default(),
             selected: None,
             frontier_index: 0,
+            connection_requested: HashSet::default(),
             last_connection_error: None,
             resolution_note: None,
             shuffler: build_shuffler(),
@@ -118,6 +119,9 @@ pub(crate) struct PickFirstPolicy {
     subchannel_states: HashMap<Address, SubchannelState>, // Cached states for all subchannels by address.
     selected: Option<Arc<dyn Subchannel>>,
     frontier_index: usize,
+    /// Addresses of subchannels asked to connect during the current connection
+    /// pass that have not reported a state since. They count as CONNECTING.
+    connection_requested: HashSet<Address>,
 
     // Detailed error tracking.
     last_connection_error: Option<String>,
@@ -262,6 +266,7 @@ impl PickFirstPolicy {
     // This clears the selected subchannel.
     fn start_connection_pass(&mut self, channel_controller: &mut dyn ChannelController) {
         self.selected = None;
+        self.connection_requested.clear();
 
         // If there is a viable subchannel at the frontier, connect to it and
         // update picker to CONNECTING.
@@ -308,9 +313,12 @@ impl PickFirstPolicy {
         // Check if First Pass is fully exhausted (frontier exhausted AND zero connecting).
         if self.frontier_index >= self.subchannels.len() {
             let any_connecting = self.subchannels.iter().any(|sc| {
-                self.subchannel_states
-                    .get(&sc.address())
-                    .is_some_and(|s| s.connectivity_state == ConnectivityState::Connecting)
+                let addr = sc.address();
+                self.connection_requested.contains(&addr)
+                    || self
+                        .subchannel_states
+                        .get(&addr)
+                        .is_some_and(|s| s.connectivity_state == ConnectivityState::Connecting)
             });
 
             if !any_connecting {
@@ -394,14 +402,17 @@ impl PickFirstPolicy {
         sc: Arc<dyn Subchannel>,
         channel_controller: &mut dyn ChannelController,
     ) {
-        self.subchannel_states.insert(
-            sc.address(),
-            SubchannelState {
-                connectivity_state: ConnectivityState::Connecting,
-                last_connection_error: None,
-            },
-        );
-        sc.connect();
+        // Only a subchannel that last reported IDLE is asked to connect. One
+        // that is already CONNECTING is treated as if it was (gRFC A61).
+        let addr = sc.address();
+        if self
+            .subchannel_states
+            .get(&addr)
+            .is_some_and(|s| s.connectivity_state == ConnectivityState::Idle)
+        {
+            sc.connect();
+            self.connection_requested.insert(addr);
+        }
 
         // Start happy eyeballs timer; replacing any pre-existing timer.
         self.timer = Some(Timer::start(
@@ -518,6 +529,7 @@ impl PickFirstPolicy {
         // Update the cache for all updates.
         self.subchannel_states
             .insert(subchannel.address(), state.clone());
+        self.connection_requested.remove(&subchannel.address());
 
         match (
             // Does the load balancer have an active subchannel already?
@@ -772,13 +784,47 @@ impl SteadyState {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use super::*;
     use crate::client::CallOptions;
     use crate::client::load_balancing::test_utils;
+    use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEnv;
     use crate::rt::default_runtime;
+
+    // A ChannelController wrapper that delegates to TestChannelController,
+    // overriding the initial SubchannelState returned by new_subchannel for
+    // configured addresses.
+    struct InitialStateController<'a> {
+        tcc: &'a mut TestChannelController,
+        initial_states: HashMap<&'a str, SubchannelState>,
+    }
+
+    impl ChannelController for InitialStateController<'_> {
+        fn new_subchannel(
+            &mut self,
+            address: &Address,
+            work_scheduler: Arc<dyn WorkScheduler>,
+        ) -> (Arc<dyn Subchannel>, SubchannelState) {
+            let (sc, state) = self.tcc.new_subchannel(address, work_scheduler);
+            let state = self
+                .initial_states
+                .get(&*address.address)
+                .cloned()
+                .unwrap_or(state);
+            (sc, state)
+        }
+
+        fn update_picker(&mut self, update: LbState) {
+            self.tcc.update_picker(update);
+        }
+
+        fn request_resolution(&mut self) {
+            self.tcc.request_resolution();
+        }
+    }
 
     // Creates an endpoint containing `addrs`, in order.
     fn endpoint(addrs: &[&str]) -> Endpoint {
@@ -881,6 +927,26 @@ mod test {
             };
             self.policy
                 .resolver_update(update, &PickFirstConfig::default(), &mut self.tcc)
+        }
+
+        // Sends a resolver update for `addrs` while overriding the initial
+        // SubchannelState returned by new_subchannel for entries in
+        // `initial_states`.
+        fn send_resolver_update_with_initial_states(
+            &mut self,
+            addrs: &[&str],
+            initial_states: &[(&str, SubchannelState)],
+        ) -> Result<(), String> {
+            let update = ResolverUpdate {
+                endpoints: Ok(create_endpoints(addrs)),
+                ..Default::default()
+            };
+            let mut controller = InitialStateController {
+                tcc: &mut self.tcc,
+                initial_states: initial_states.iter().cloned().collect(),
+            };
+            self.policy
+                .resolver_update(update, &PickFirstConfig::default(), &mut controller)
         }
 
         // Lets the Connection Attempt Delay timer fire, and delivers the
@@ -1228,6 +1294,27 @@ mod test {
         env.expect_no_events();
     }
 
+    // If new_subchannel returns a subchannel already in CONNECTING, the first
+    // pass waits on it without calling connect(), and advances when the
+    // Connection Attempt Delay timer fires (gRFC A61).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_new_subchannel_initially_connecting() {
+        let mut env = new_env();
+        env.send_resolver_update_with_initial_states(
+            &["addr1", "addr2"],
+            &[("addr1", SubchannelState::connecting())],
+        )
+        .unwrap();
+
+        env.expect_new_subchannels(&["addr1", "addr2"]);
+        env.expect_queuing_picker();
+        env.expect_no_events();
+
+        env.fire_timer().await;
+        env.expect_connect_to("addr2");
+        env.expect_no_events();
+    }
+
     // Freshest Error Caching (Steady State)
     // Ensures background failures during Steady State continuously overwrite
     // stale connection errors.
@@ -1256,6 +1343,52 @@ mod test {
             .unwrap();
         env.expect_failing_picker("steady state network drop");
         env.expect_request_resolution();
+        env.expect_no_events();
+    }
+
+    // Tests that once reporting TRANSIENT_FAILURE after all addresses fail,
+    // the policy keeps reporting it across resolver updates and new first
+    // passes until a subchannel becomes READY (sticky-TF, gRFC A62).
+    #[tokio::test(start_paused = true)]
+    async fn test_pick_first_sticky_transient_failure_across_resolver_updates() {
+        let mut env = new_env();
+        env.simulate_failed_connection(&["addr1"]);
+        env.expect_failing_picker("connection refused");
+        env.expect_request_resolution();
+
+        // Re-resolution returns [addr1, addr2]. A new pass starts without
+        // reporting CONNECTING. addr1 already failed, so addr2 is attempted.
+        let endpoints = create_endpoints(&["addr1", "addr2"]);
+        env.send_resolver_update(endpoints).unwrap();
+        let sc2 = env.expect_new_subchannel_for("addr2");
+        env.expect_connect_to("addr2");
+        env.expect_no_events();
+        env.send_subchannel_update(&sc2, &SubchannelState::connecting());
+        env.expect_no_events();
+
+        // Another update during the pass also leaves the reported state
+        // unchanged. addr2 reported CONNECTING, so it is not asked to connect
+        // again.
+        let endpoints = create_endpoints(&["addr2", "addr3"]);
+        env.send_resolver_update(endpoints).unwrap();
+        let sc3 = env.expect_new_subchannel_for("addr3");
+        env.expect_no_events();
+
+        // addr2 fails, and the pass moves on to addr3.
+        env.send_subchannel_update(&sc2, &SubchannelState::transient_failure("addr2 failed"));
+        env.expect_connect_to("addr3");
+        env.expect_no_events();
+
+        // addr3 fails, ending the pass. TRANSIENT_FAILURE is reported again
+        // with the latest error.
+        env.send_subchannel_update(&sc3, &SubchannelState::transient_failure("addr3 failed"));
+        env.expect_failing_picker("addr3 failed");
+        env.expect_request_resolution();
+        env.expect_no_events();
+
+        // A READY subchannel ends sticky TRANSIENT_FAILURE.
+        env.send_subchannel_update(&sc3, &SubchannelState::ready());
+        env.expect_ready_picker(&sc3);
         env.expect_no_events();
     }
 
